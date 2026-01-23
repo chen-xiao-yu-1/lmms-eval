@@ -126,6 +126,19 @@ class UniPic2VisualCoT(lmms):
         self.generated_images_dir = os.path.join(self.output_dir, "generated_images")
         os.makedirs(self.generated_images_dir, exist_ok=True)
 
+        if intermediate_dir is None:
+            self.intermediate_dir = os.path.join(
+                self.output_dir, "intermediate_artifacts"
+            )
+        else:
+            self.intermediate_dir = intermediate_dir
+
+        if save_intermediate:
+            os.makedirs(self.intermediate_dir, exist_ok=True)
+            eval_logger.info(
+                f"Intermediate artifacts will be saved to: {self.intermediate_dir}"
+            )
+
         self.stage1_max_tokens = stage1_max_tokens
         self.stage1_temperature = stage1_temperature
         self.stage1_num_inference_steps = stage1_num_inference_steps
@@ -532,6 +545,40 @@ class UniPic2VisualCoT(lmms):
                 return ""
             raise e
 
+    def _save_intermediate_artifacts(
+        self,
+        doc_id: str,
+        task: str,
+        generation_prompt: str,
+        stage1_text: str,
+        generated_images: List[str],
+        question: str,
+        stage2_answer: str,
+    ) -> None:
+        """Save intermediate artifacts for debugging"""
+        if not self.save_intermediate:
+            return
+
+        artifact_dir = os.path.join(self.intermediate_dir, task)
+        os.makedirs(artifact_dir, exist_ok=True)
+
+        # Save metadata
+        metadata = {
+            "doc_id": doc_id,
+            "task": task,
+            "generation_prompt": generation_prompt,
+            "stage1_text": stage1_text,
+            "generated_images": generated_images,
+            "question": question,
+            "stage2_answer": stage2_answer,
+        }
+
+        metadata_path = os.path.join(artifact_dir, f"{doc_id}_metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+        eval_logger.debug(f"Saved intermediate artifacts to: {metadata_path}")
+
     def generate_uni_mmmu_interleaved(
         self,
         input_images: List,
@@ -757,12 +804,23 @@ class UniPic2VisualCoT(lmms):
                 if visuals: original_image = visuals[0]
 
             gen_prompt = self.generation_prompt_template.format(question=contexts)
-            _, gen_paths = self._stage1_generate_image(gen_prompt, doc_id, task, original_image)
+            stage1_text, gen_paths = self._stage1_generate_image(gen_prompt, doc_id, task, original_image)
 
             if gen_paths:
                 final_ans = self._stage2_answer_with_image(contexts, gen_paths[0], original_image)
             else:
                 final_ans = ""
+
+            # Save intermediate artifacts if enabled
+            self._save_intermediate_artifacts(
+                doc_id=doc_id,
+                task=task,
+                generation_prompt=gen_prompt,
+                stage1_text=stage1_text,
+                generated_images=gen_paths,
+                question=contexts,
+                stage2_answer=final_ans,
+            )
 
             res.append(final_ans)
             torch.cuda.empty_cache()
