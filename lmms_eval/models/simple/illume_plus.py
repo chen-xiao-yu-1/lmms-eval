@@ -378,17 +378,10 @@ class ILLUMEPlus(lmms):
                 max_width = max(img.width for img in images)
                 max_height = max(img.height for img in images)
 
-                # =================================================================
-                # [MODIFIED] Dynamic Resolution Strategy for OOM Prevention
-                # =================================================================
-                # 如果是多图（如 MMSI），强制降级到 512 以防止显存 OOM
-                # 如果是单图，保持 1024 以获得最佳细节
                 if len(images) > 1:
                     max_dim = 512
-                    # eval_logger.debug(f"Multi-image detected ({len(images)}), clamping max_dim to {max_dim}")
                 else:
                     max_dim = 1024
-                # =================================================================
 
                 if max_width > max_dim or max_height > max_dim:
                     scale = max_dim / max(max_width, max_height)

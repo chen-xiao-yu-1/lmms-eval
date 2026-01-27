@@ -9,22 +9,25 @@ Usage:
     python -m lmms_eval \
         --model illume_plus_visual_cot \
         --model_args pretrained=ILLUME-MLLM/illume_plus-qwen2_5-7b-hf \
-        --tasks mme \
+        --tasks mme \    
         --batch_size 1 \
         --device cuda:0
 """
 
 import json
 import os
+import re
+import sys
 from io import BytesIO
-from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from accelerate import Accelerator, DistributedType
 from loguru import logger as eval_logger
 from PIL import Image
 from tqdm import tqdm
+from transformers import LogitsProcessorList
 
 from lmms_eval import utils
 from lmms_eval.api.instance import Instance
@@ -66,7 +69,7 @@ class ILLUMEPlusVisualCoT(lmms):
         stage1_top_p: Optional[float] = 0.9,
         stage1_num_beams: int = 1,
         # Stage 2: Visual understanding parameters
-        stage2_max_new_tokens: int = 4096,
+        stage2_max_new_tokens: int = 4096,  # Reduced from 4096 to save memory
         stage2_temperature: float = 0.0,
         stage2_top_p: Optional[float] = None,
         stage2_num_beams: int = 1,
@@ -81,6 +84,11 @@ class ILLUMEPlusVisualCoT(lmms):
         intermediate_dir: Optional[str] = None,
         # Error handling
         fail_gracefully: bool = True,
+        # Vision tokenizer/decoder parameters
+        enable_image_decoding: bool = True,
+        tokenizer_config_path: Optional[str] = None,
+        tokenizer_checkpoint: Optional[str] = None,
+        diffusion_decoder_path: Optional[str] = None,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -94,6 +102,10 @@ class ILLUMEPlusVisualCoT(lmms):
         self.generation_prompt_template = generation_prompt_template
         self.infer_auto_device_map = infer_auto_device_map
         self.device_map = device_map
+        self.enable_image_decoding = enable_image_decoding
+        self.tokenizer_config_path = tokenizer_config_path
+        self.tokenizer_checkpoint = tokenizer_checkpoint
+        self.diffusion_decoder_path = diffusion_decoder_path
 
         # Stage 1 parameters
         self.stage1_max_new_tokens = stage1_max_new_tokens
@@ -168,6 +180,25 @@ class ILLUMEPlusVisualCoT(lmms):
         eval_logger.info(f"Loading ILLUME+ model from {pretrained}")
         self._load_model(pretrained, attn_implementation)
 
+        # Initialize ILLUME+ generation components (logits processor, special tokens)
+        eval_logger.info("Initializing ILLUME+ generation components")
+        self._init_illume_generation_components()
+
+        # Load vision tokenizer/decoder if enabled
+        self.vq_model = None
+        self.diffusion_decoder_pipe = None
+        if self.enable_image_decoding:
+            eval_logger.info(
+                "Image decoding is enabled, loading vision tokenizer/decoder"
+            )
+            self._load_vision_decoder()
+        else:
+            eval_logger.warning(
+                "Image decoding is DISABLED. Generated images will be blank placeholders. "
+                "To enable actual image generation, set enable_image_decoding=True and provide "
+                "tokenizer_config_path, tokenizer_checkpoint, and diffusion_decoder_path."
+            )
+
         self.batch_size_per_gpu = int(batch_size)
         assert self.batch_size_per_gpu == 1, "batch_size > 1 not supported"
 
@@ -223,8 +254,7 @@ class ILLUMEPlusVisualCoT(lmms):
                     weight_files = [
                         f
                         for f in files
-                        if f.endswith((".safetensors", ".bin"))
-                        and "pytorch_model" in f
+                        if f.endswith((".safetensors", ".bin")) and "pytorch_model" in f
                     ]
                     index_files = [f for f in files if f.endswith(".index.json")]
 
@@ -255,7 +285,9 @@ class ILLUMEPlusVisualCoT(lmms):
             import time
 
             start_time = time.time()
-            self._processor = AutoProcessor.from_pretrained(pretrained, **processor_kwargs)
+            self._processor = AutoProcessor.from_pretrained(
+                pretrained, **processor_kwargs
+            )
             elapsed = time.time() - start_time
             eval_logger.info(f"Processor loaded in {elapsed:.1f} seconds")
 
@@ -322,6 +354,393 @@ class ILLUMEPlusVisualCoT(lmms):
             eval_logger.error(traceback.format_exc())
             raise
 
+    def _init_illume_generation_components(self):
+        """Initialize ILLUME+ specific generation components."""
+        try:
+            # Try to import from ILLUME_plus directory first (preferred for full feature support)
+            illume_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                "ILLUME_plus",
+                "ILLUME",
+            )
+
+            processor_loaded = False
+            if os.path.exists(illume_path):
+                if illume_path not in sys.path:
+                    sys.path.insert(0, illume_path)
+                    eval_logger.info(f"Added ILLUME path to sys.path: {illume_path}")
+
+                try:
+                    from generation_eval.models.inference_utils import (
+                        InterleavedLogitsProcessor,
+                    )
+
+                    self.InterleavedLogitsProcessor = InterleavedLogitsProcessor
+                    self._processor_supports_image_sizes = True
+                    eval_logger.info(
+                        "Successfully imported InterleavedLogitsProcessor from ILLUME_plus directory (full feature support)"
+                    )
+                    processor_loaded = True
+                except ImportError as e:
+                    eval_logger.warning(
+                        f"Failed to import from ILLUME_plus directory: {e}"
+                    )
+
+            # Fallback to model directory if ILLUME_plus import failed
+            if not processor_loaded:
+                model_path = self.pretrained
+                if os.path.exists(model_path) and model_path not in sys.path:
+                    sys.path.insert(0, model_path)
+                    eval_logger.info(f"Added model path to sys.path: {model_path}")
+
+                from inference_utils import InterleavedLogitsProcessor
+
+                self.InterleavedLogitsProcessor = InterleavedLogitsProcessor
+                self._processor_supports_image_sizes = False
+                eval_logger.info(
+                    "Successfully imported InterleavedLogitsProcessor from model directory (limited feature support)"
+                )
+
+            eval_logger.info(
+                f"InterleavedLogitsProcessor loaded successfully (image_sizes support: {self._processor_supports_image_sizes})"
+            )
+
+            # Define special tokens for Qwen2.5
+            self.special_tokens_ids = [
+                151665,
+                151666,
+                151667,
+                151668,
+                151669,
+                151670,
+                151671,
+            ]
+            start_token = 151672 + 32
+            self.level0_range = (start_token, start_token + 32768)
+            self.level1_range = (start_token + 32768, start_token + 32768 * 4)
+
+            self.special_tokens_dict = {
+                "start_of_image": 151665,
+                "end_of_image": 151666,
+                "start_of_level0": 151668,
+                "end_of_level0": 151669,
+                "start_of_level1": 151670,
+                "end_of_level1": 151671,
+                "end_of_line": 151667,
+                "end_of_text": 151645,
+                "level0_range": self.level0_range,
+                "level1_range": self.level1_range,
+            }
+
+            eval_logger.info("ILLUME+ generation components initialized successfully")
+
+        except ImportError as e:
+            eval_logger.error(
+                f"Failed to import ILLUME+ generation utilities: {e}. "
+                f"Image generation will not work properly."
+            )
+            self.InterleavedLogitsProcessor = None
+            self.special_tokens_dict = None
+            self._processor_supports_image_sizes = False
+        except Exception as e:
+            eval_logger.error(f"Failed to initialize ILLUME+ components: {e}")
+            import traceback
+
+            eval_logger.error(traceback.format_exc())
+            self.InterleavedLogitsProcessor = None
+            self.special_tokens_dict = None
+            self._processor_supports_image_sizes = False
+
+    def _calculate_image_token_dimensions(
+        self, h: int, w: int, downsample_rate_per_level: List[int] = [28, 16]
+    ) -> Tuple[int, int, int, int, int]:
+        """
+        Calculate image token dimensions for given resolution.
+
+        Args:
+            h: Image height
+            w: Image width
+            downsample_rate_per_level: Downsampling rates for each level
+
+        Returns:
+            Tuple of (semantic_token_num, pixel_token_num, h1, w1, h2, w2)
+        """
+        # Try to import RESOLUTION_MAPPING
+        try:
+            # Ensure vision_tokenizer is in path
+            import sys
+            import os
+
+            project_root = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            )
+            vision_tokenizer_path = os.path.join(
+                project_root, "ILLUME_plus", "vision_tokenizer"
+            )
+            if (
+                os.path.exists(vision_tokenizer_path)
+                and vision_tokenizer_path not in sys.path
+            ):
+                sys.path.insert(0, vision_tokenizer_path)
+
+            from tokenizer.dualvitok_model import RESOLUTION_MAPPING
+
+            mapped_w, mapped_h = RESOLUTION_MAPPING.get((w, h), (w, h))
+        except ImportError:
+            eval_logger.warning(
+                "Could not import RESOLUTION_MAPPING, using original resolution"
+            )
+            mapped_w, mapped_h = w, h
+
+        # Level 0 - Semantic tokens
+        w1 = mapped_w // downsample_rate_per_level[0]
+        h1 = mapped_h // downsample_rate_per_level[0]
+        semantic_token_num = w1 * h1
+
+        # Level 1 - Pixel tokens
+        w2 = w // downsample_rate_per_level[1]
+        h2 = h // downsample_rate_per_level[1]
+        pixel_token_num = w2 * h2
+
+        return semantic_token_num, pixel_token_num, h1, w1, h2, w2
+
+    def _load_vision_decoder(self):
+        """Official HF style loading to align with the HuggingFace example."""
+        try:
+            from transformers import AutoModel
+            import os
+
+            if not self.tokenizer_config_path:
+                eval_logger.error(
+                    "tokenizer_config_path is required for image decoding"
+                )
+                return
+
+            eval_logger.info("Loading vision tokenizer via Official HF style...")
+
+            if os.path.isfile(self.tokenizer_config_path):
+                model_dir = os.path.dirname(self.tokenizer_config_path)
+            else:
+                model_dir = self.tokenizer_config_path
+
+            eval_logger.info(f"Targeting model directory: {model_dir}")
+
+            # Load model using AutoModel to trigger remote code (configuration_dualvitok.py)
+            # This automatically handles field mappings like 'out_layer' -> 'proj_layer'
+            dualvitok = (
+                AutoModel.from_pretrained(
+                    model_dir, trust_remote_code=True, torch_dtype=self._dtype
+                )
+                .to(self._device)
+                .eval()
+            )
+
+            # Attach vision tokenizer to the processor as per official documentation
+            if hasattr(self._processor, "set_vision_tokenizer"):
+                self._processor.set_vision_tokenizer(dualvitok)
+                eval_logger.info("Vision tokenizer (DualViTok) linked to processor.")
+            else:
+                eval_logger.warning(
+                    "Processor does not have set_vision_tokenizer method."
+                )
+
+            self.vq_model = dualvitok
+
+            # Load SDXL diffusion decoder via processor
+            if self.diffusion_decoder_path:
+                eval_logger.info(
+                    f"Loading SDXL via processor: {self.diffusion_decoder_path}"
+                )
+                if hasattr(self._processor, "load_diffusion_vision_detokenizer"):
+                    self._processor.load_diffusion_vision_detokenizer(
+                        self.diffusion_decoder_path
+                    )
+                    self.diffusion_decoder_pipe = getattr(
+                        self._processor, "diffusion_model", None
+                    )
+                    eval_logger.info("Diffusion decoder loaded successfully.")
+                else:
+                    eval_logger.warning(
+                        "Processor does not support load_diffusion_vision_detokenizer."
+                    )
+
+            eval_logger.info(
+                "Vision decoder initialization complete via official HF style."
+            )
+
+        except Exception as e:
+            eval_logger.error(f"Failed to load via official style: {e}")
+            import traceback
+
+            eval_logger.error(traceback.format_exc())
+
+    def _extract_image_tokens_from_text(
+        self, text: str, num_levels: int = 2
+    ) -> Optional[List[List[int]]]:
+        """
+        Extract image tokens from generated text.
+
+        Args:
+            text: Generated text containing image tokens
+            num_levels: Number of token levels (default: 2 for semantic + pixel)
+
+        Returns:
+            List of token lists for each level, or None if no tokens found
+        """
+        try:
+            image_embed_inds = []
+            for level in range(num_levels):
+                pattern = r"<\|image_level{}_(\d+)\|>".format(level)
+                matches = re.findall(pattern, text)
+                image_embed_ind = [int(num) for num in matches]
+                image_embed_inds.append(image_embed_ind)
+
+            # Check if we found any tokens
+            if all(len(tokens) == 0 for tokens in image_embed_inds):
+                return None
+
+            return image_embed_inds
+
+        except Exception as e:
+            eval_logger.error(f"Failed to extract image tokens: {e}")
+            return None
+
+    def _decode_image_tokens(
+        self,
+        image_tokens: List[List[int]],
+        resolution: Tuple[int, int],
+        use_diffusion: bool = True,
+    ) -> Optional[np.ndarray]:
+        """
+        Decode image tokens to actual image.
+
+        Args:
+            image_tokens: List of [semantic_tokens, pixel_tokens]
+            resolution: Target resolution (h, w)
+            use_diffusion: Whether to use diffusion decoder
+
+        Returns:
+            Decoded image as numpy array, or None if decoding fails
+        """
+        try:
+            if self.vq_model is None:
+                eval_logger.warning("VQ model not loaded, cannot decode image")
+                return None
+
+            if len(image_tokens) < 2:
+                eval_logger.warning(f"Expected 2 token levels, got {len(image_tokens)}")
+                return None
+
+            semantic_tokens = image_tokens[0]
+            pixel_tokens = image_tokens[1]
+
+            if len(semantic_tokens) == 0 or len(pixel_tokens) == 0:
+                eval_logger.warning("Empty token lists, cannot decode image")
+                return None
+
+            # Calculate expected dimensions
+            h, w = resolution
+
+            # Ensure vision_tokenizer is in path
+            import sys
+            import os
+
+            project_root = os.path.dirname(
+                os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+            )
+            vision_tokenizer_path = os.path.join(
+                project_root, "ILLUME_plus", "vision_tokenizer"
+            )
+            if (
+                os.path.exists(vision_tokenizer_path)
+                and vision_tokenizer_path not in sys.path
+            ):
+                sys.path.insert(0, vision_tokenizer_path)
+
+            try:
+                from tokenizer.dualvitok_model import RESOLUTION_MAPPING
+
+                mapped_w, mapped_h = RESOLUTION_MAPPING.get(
+                    (w, h), (w, h)
+                )  # Fallback to original if not in mapping
+            except ImportError:
+                eval_logger.warning(
+                    "Could not import RESOLUTION_MAPPING, using original resolution"
+                )
+                mapped_w, mapped_h = w, h
+
+            # Semantic tokens: downsampled by 28
+            h1 = mapped_h // 28
+            w1 = mapped_w // 28
+            expected_semantic = h1 * w1
+
+            # Pixel tokens: downsampled by 16
+            h2 = h // 16
+            w2 = w // 16
+            expected_pixel = h2 * w2
+
+            eval_logger.debug(
+                f"Expected tokens - semantic: {expected_semantic} ({h1}x{w1}), "
+                f"pixel: {expected_pixel} ({h2}x{w2})"
+            )
+            eval_logger.debug(
+                f"Got tokens - semantic: {len(semantic_tokens)}, "
+                f"pixel: {len(pixel_tokens)}"
+            )
+
+            # Convert to tensors and reshape
+            semantic_code = torch.as_tensor([semantic_tokens])
+            pixel_code = torch.as_tensor([pixel_tokens])
+
+            # Reshape to 2D grids
+            try:
+                semantic_code = semantic_code.view(1, h1, w1)
+                pixel_code = pixel_code.view(1, h2, w2)
+            except RuntimeError as e:
+                eval_logger.error(
+                    f"Failed to reshape tokens: {e}. "
+                    f"Semantic: {len(semantic_tokens)} -> (1, {h1}, {w1}), "
+                    f"Pixel: {len(pixel_tokens)} -> (1, {h2}, {w2})"
+                )
+                return None
+
+            # Decode using diffusion decoder if available
+            if use_diffusion and self.diffusion_decoder_pipe is not None:
+                eval_logger.debug("Using diffusion decoder")
+                diffusion_outputs = self.diffusion_decoder_pipe(
+                    vq_indices=(semantic_code, pixel_code),
+                    height=h * 2,
+                    width=w * 2,
+                    guidance_scale=1.5,
+                    num_inference_steps=50,
+                    generator=torch.Generator(self._device).manual_seed(42),
+                )
+                samples = diffusion_outputs.images
+                decoded_image = np.asarray(samples[0])
+            else:
+                # Use VQ decoder
+                eval_logger.debug("Using VQ decoder")
+                quant_semantic = self.vq_model.semantic_quantizer.indices_to_codes(
+                    semantic_code
+                )
+                quant_pixel = self.vq_model.pixel_quantizer.indices_to_codes(pixel_code)
+                samples = self.vq_model.decode(quant_semantic, quant_pixel)
+                decoded_image = (
+                    torch.clamp(127.5 * samples + 128.0, 0, 255)
+                    .permute(0, 2, 3, 1)
+                    .to("cpu", dtype=torch.uint8)
+                    .numpy()[0]
+                )
+
+            return decoded_image
+
+        except Exception as e:
+            eval_logger.error(f"Failed to decode image tokens: {e}")
+            import traceback
+
+            eval_logger.error(traceback.format_exc())
+            return None
+
     @property
     def config(self):
         """Return the model config."""
@@ -378,9 +797,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 new_list.append(j)
         return new_list
 
-    def _extract_image_from_various_formats(
-        self, img_data
-    ) -> Optional[Image.Image]:
+    def _extract_image_from_various_formats(self, img_data) -> Optional[Image.Image]:
         """Extract PIL Image from various formats."""
         try:
             if img_data is None:
@@ -427,118 +844,289 @@ class ILLUMEPlusVisualCoT(lmms):
         return normalized_images
 
     def _stage1_generate_image(
-        self, generation_prompt: str, doc_id: str, task: str, original_image=None
+        self, generation_prompt: str, doc_id: str, task: str, original_images=None
     ) -> Tuple[str, List[str]]:
-        """
-        Stage 1: Generate visualization image from prompt.
-
-        Args:
-            generation_prompt: Text prompt for image generation
-            doc_id: Document ID for file naming
-            task: Task name for file naming
-            original_image: Original image to condition on (optional)
-
-        Returns:
-            Tuple of (generated_text, list_of_image_paths)
-        """
-        eval_logger.debug(f"Stage 1 - Generating image for doc {doc_id}")
-        eval_logger.debug(f"Generation prompt: {generation_prompt}")
-
         try:
-            # Extract original image if provided
-            original_image = self._extract_image_from_various_formats(original_image)
-            if original_image is not None:
-                eval_logger.debug("Stage 1 - Using original image as conditioning input")
+            images = []
+            if original_images is not None:
+                if not isinstance(original_images, list):
+                    original_images = [original_images]
+                for img in original_images:
+                    extracted_img = self._extract_image_from_various_formats(img)
+                    if extracted_img is not None:
+                        images.append(extracted_img)
 
-            # Build conversation for generation
-            images = [original_image] if original_image else []
+            if images:
+                h, w = images[0].size[1], images[0].size[0]
+            else:
+                h, w = 512, 512
 
-            # Build conversation format
-            conversation = [
-                {
-                    "role": "system",
-                    "content": [{"type": "text", "text": "You are a helpful assistant."}],
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        [{"type": "image"}] * len(images)
-                        + [{"type": "text", "text": generation_prompt}]
-                    ),
-                },
+            # ILLUME+ only supports specific resolutions
+            SUPPORTED_RESOLUTIONS = [
+                (256, 256), (512, 512), (384, 640), (640, 384),
+                (512, 384), (384, 512), (256, 384), (384, 256),
+                (256, 512), (512, 256)
             ]
 
-            # Normalize image sizes if there are multiple images
-            if len(images) > 1:
-                images = self._normalize_image_sizes(images)
+            # Find the closest supported resolution
+            def find_closest_resolution(target_h, target_w, supported_resolutions):
+                """Find the closest supported resolution that maintains aspect ratio."""
+                target_ratio = target_w / target_h
+                best_resolution = None
+                best_score = float('inf')
 
-            # Process inputs
-            inputs = self._processor(text=conversation, images=images, return_tensors="pt")
+                for res_h, res_w in supported_resolutions:
+                    res_ratio = res_w / res_h
+                    # Score based on aspect ratio difference and size difference
+                    ratio_diff = abs(res_ratio - target_ratio)
+                    size_diff = abs(res_h * res_w - target_h * target_w) / (target_h * target_w)
+                    score = ratio_diff + 0.1 * size_diff
 
-            # Move inputs to appropriate device
-            if self.infer_auto_device_map or self.device_map == "auto":
-                inputs = inputs.to("cuda")
+                    if score < best_score:
+                        best_score = score
+                        best_resolution = (res_h, res_w)
+
+                return best_resolution
+
+            # Use closest supported resolution
+            h, w = find_closest_resolution(h, w, SUPPORTED_RESOLUTIONS)
+            eval_logger.info(f"Using supported resolution: {h}x{w}")
+
+            resolution_tag = f"<height_{h}><width_{w}>"
+
+            # Use ILLUME+ processor's official templates
+            # Note: Don't include <image> in text - it's handled by conversation structure
+            if images:
+                # Image editing mode
+                # The <image> will be inserted by processor based on conversation structure
+                full_prompt = f"{resolution_tag}\nPlease edit the image according to the instruction: {generation_prompt}\n"
+                uncond_prompt = f"{resolution_tag}\nReconstruct the image according to the given image\n"
             else:
-                inputs = inputs.to(self._device)
+                # Image generation mode
+                full_prompt = f"Generate an image of {resolution_tag}, the content of image is {generation_prompt}\n"
+                uncond_prompt = f"Generate a random image of {resolution_tag}\n"
 
-            # Prepare generation kwargs for stage 1
-            generate_kwargs = {
-                "max_new_tokens": self.stage1_max_new_tokens,
-                "use_cache": self.use_cache,
+            eval_logger.info(f"Generation prompt: {full_prompt[:200]}")
+            eval_logger.info(f"Unconditional prompt: {uncond_prompt[:200]}")
+
+            if images:
+                if len(images) > 1:
+                    images = self._normalize_image_sizes(images)
+                conversation = [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "image"}] * len(images)
+                        + [{"type": "text", "text": full_prompt}],
+                    },
+                ]
+                inputs = self._processor(
+                    text=conversation, images=images, return_tensors="pt"
+                )
+            else:
+                conversation = [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": full_prompt}],
+                    },
+                ]
+                inputs = self._processor(
+                    text=conversation, images=None, return_tensors="pt"
+                )
+
+            inputs = inputs.to(self._device)
+
+            # Process unconditional prompt for classifier-free guidance
+            if images:
+                # For image editing with CFG
+                uncond_conversation = [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "image"}] * len(images)
+                        + [{"type": "text", "text": uncond_prompt}],
+                    },
+                ]
+                uncond_inputs = self._processor(
+                    text=uncond_conversation, images=images, return_tensors="pt"
+                )
+                uncond_inputs = uncond_inputs.to(self._device)
+            else:
+                # For image generation with CFG
+                uncond_conversation = [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": uncond_prompt}],
+                    },
+                ]
+                uncond_inputs = self._processor(
+                    text=uncond_conversation, images=None, return_tensors="pt"
+                )
+                uncond_inputs = uncond_inputs.to(self._device)
+
+            semantic_token_num, pixel_token_num, h1, w1, h2, w2 = (
+                self._calculate_image_token_dimensions(h, w)
+            )
+            expected_image_tokens = (h1 * (w1 + 1) + 2) + (h2 * (w2 + 1) + 2) + 50
+
+            # Use different parameters for image editing vs generation
+            if images:
+                # Image editing parameters - use simpler settings first
+                generate_kwargs = {
+                    "max_new_tokens": max(8192, expected_image_tokens + 500),
+                    "use_cache": self.use_cache,
+                    "do_sample": True,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                }
+                # Start with no CFG to test basic functionality
+                default_temp = 1.0
+                level0_temp = 1.0
+                level1_temp = 1.0
+                level0_top_k = 2048
+                level1_top_k = 2048 * 3
+                guidance_scale = 1.0  # Disable CFG for now
+            else:
+                # Image generation parameters
+                generate_kwargs = {
+                    "max_new_tokens": max(8192, expected_image_tokens + 500),
+                    "use_cache": self.use_cache,
+                    "do_sample": True,
+                    "temperature": 0.7,
+                    "top_p": 0.9,
+                }
+                default_temp = 0.7
+                level0_temp = 0.7
+                level1_temp = 0.7
+                level0_top_k = 2048
+                level1_top_k = 6144
+                guidance_scale = 1.0
+
+            if self.InterleavedLogitsProcessor is None:
+                raise RuntimeError(
+                    "InterleavedLogitsProcessor is not available. "
+                    "Image generation requires the ILLUME+ generation utilities. "
+                    "Please ensure the ILLUME_plus directory is properly set up."
+                )
+
+            try:
+                processor_kwargs = {
+                    "guidance_scale": guidance_scale,
+                    "uncond": uncond_inputs["input_ids"] if guidance_scale > 1.0 else None,
+                    "attention_mask": uncond_inputs.get("attention_mask", None) if guidance_scale > 1.0 else None,
+                    "model": self._model,
+                    "level0_range": self.level0_range,
+                    "level1_range": self.level1_range,
+                    "num_level0_rows": h1,
+                    "num_level0_tokens": w1,
+                    "num_level1_rows": h2,
+                    "num_level1_tokens": w2,
+                    "special_tokens": self.special_tokens_dict,
+                    "default_temp": default_temp,
+                    "level0_temp": level0_temp,
+                    "level1_temp": level1_temp,
+                    "default_top_k": 2048,
+                    "level0_top_k": level0_top_k,
+                    "level1_top_k": level1_top_k,
+                    "default_top_p": 0.9,
+                    "images": inputs.get("pixel_values", None),
+                }
+
+                # Only add image_sizes if the processor supports it
+                if self._processor_supports_image_sizes:
+                    processor_kwargs["image_sizes"] = [(w, h)]
+
+                logits_processor = self.InterleavedLogitsProcessor(**processor_kwargs)
+                generate_kwargs["logits_processor"] = LogitsProcessorList(
+                    [logits_processor]
+                )
+                mode = "image editing" if images else "image generation"
+                eval_logger.info(
+                    f"Successfully created InterleavedLogitsProcessor for {mode} ({h}x{w})"
+                )
+            except Exception as e:
+                eval_logger.error(f"Failed to create logits processor: {e}")
+                import traceback
+
+                eval_logger.error(traceback.format_exc())
+                raise RuntimeError(
+                    f"Cannot generate images without logits processor: {e}"
+                )
+
+            # Add ILLUME+ specific image generation parameters
+            image_gen_kwargs = {
+                "target_image_resolution": (h, w),
+                "guidance_scale": guidance_scale,
+                "image_semantic_temperature": default_temp,
+                "image_semantic_top_k": level0_top_k,
+                "image_semantic_top_p": generate_kwargs.get("top_p", 1.0),
+                "image_pixel_temperature": level1_temp,
+                "image_pixel_top_k": level1_top_k,
+                "image_pixel_top_p": generate_kwargs.get("top_p", 1.0),
             }
 
-            # Add sampling parameters
-            if self.stage1_temperature > 0:
-                generate_kwargs["do_sample"] = True
-                generate_kwargs["temperature"] = self.stage1_temperature
-                if self.stage1_top_p is not None:
-                    generate_kwargs["top_p"] = self.stage1_top_p
-            else:
-                generate_kwargs["do_sample"] = False
+            # Add unconditional prompt for CFG if guidance_scale > 1
+            if guidance_scale > 1.0:
+                image_gen_kwargs["negative_image_prompt_ids"] = uncond_inputs["input_ids"]
+                image_gen_kwargs["negative_image_prompt_attention_mask"] = uncond_inputs.get("attention_mask", None)
 
-            if self.stage1_num_beams > 1:
-                generate_kwargs["num_beams"] = self.stage1_num_beams
-
-            # Generate response (ILLUME+ can generate both text and images)
             with torch.no_grad():
-                outputs = self._model.generate(**inputs, **generate_kwargs)
+                outputs = self._model.generate(**inputs, **generate_kwargs, **image_gen_kwargs)
 
-            # Decode response
             outputs_text = outputs[:, inputs["input_ids"].shape[1] :]
             generated_text = self._processor.batch_decode(
-                outputs_text, skip_special_tokens=True
+                outputs_text, skip_special_tokens=False
             )[0]
 
-            eval_logger.debug(f"Stage 1 - Generated text: {generated_text[:100]}...")
+            image_tokens = self._extract_image_tokens_from_text(generated_text)
 
-            # Check if ILLUME+ generated an image
-            # ILLUME+ may output image tokens that need to be decoded
-            # For now, we'll save the generated text and create a placeholder
-            # In a full implementation, you would decode image tokens here
-
-            # Save generated "image" (for now, we'll create a text-based visualization)
-            # In practice, ILLUME+ should generate actual image tokens
             task_dir = os.path.join(self.generated_images_dir, task)
             os.makedirs(task_dir, exist_ok=True)
             image_path = os.path.join(task_dir, f"{doc_id}_gen.png")
 
-            # Create a simple visualization image with the generated text
-            # This is a placeholder - in a full implementation, decode actual image tokens
-            viz_image = Image.new("RGB", (512, 512), color=(255, 255, 255))
-            viz_image.save(image_path)
-
-            eval_logger.info(f"Generated image saved to {image_path}")
-
-            del outputs, inputs
-            torch.cuda.empty_cache()
+            if image_tokens and self.enable_image_decoding:
+                eval_logger.info(
+                    f"Decoding captured tokens: L0={len(image_tokens[0])}, L1={len(image_tokens[1])}"
+                )
+                decoded_image = self._decode_image_tokens(
+                    image_tokens, resolution=(h, w), use_diffusion=True
+                )
+                if decoded_image is not None:
+                    Image.fromarray(decoded_image).save(image_path)
+                else:
+                    Image.new("RGB", (h, w), color=(128, 128, 128)).save(image_path)
+            else:
+                eval_logger.warning(
+                    f"No image tokens found. Preview: {generated_text[:100]}"
+                )
+                Image.new("RGB", (h, w), color=(200, 200, 200)).save(image_path)
 
             return generated_text, [image_path]
 
         except Exception as e:
             eval_logger.error(f"Stage 1 generation error: {e}")
-            import traceback
-
-            eval_logger.error(traceback.format_exc())
             if self.fail_gracefully:
                 return "", []
             raise
@@ -566,7 +1154,9 @@ class ILLUMEPlusVisualCoT(lmms):
 
             # Add original image first (if available)
             if original_image:
-                original_image = self._extract_image_from_various_formats(original_image)
+                original_image = self._extract_image_from_various_formats(
+                    original_image
+                )
                 if original_image:
                     images.append(original_image)
                     eval_logger.debug("Stage 2 - Added original image")
@@ -583,7 +1173,9 @@ class ILLUMEPlusVisualCoT(lmms):
             conversation = [
                 {
                     "role": "system",
-                    "content": [{"type": "text", "text": "You are a helpful assistant."}],
+                    "content": [
+                        {"type": "text", "text": "You are a helpful assistant."}
+                    ],
                 },
                 {
                     "role": "user",
@@ -595,7 +1187,9 @@ class ILLUMEPlusVisualCoT(lmms):
             ]
 
             # Process inputs
-            inputs = self._processor(text=conversation, images=images, return_tensors="pt")
+            inputs = self._processor(
+                text=conversation, images=images, return_tensors="pt"
+            )
 
             # Move inputs to appropriate device
             if self.infer_auto_device_map or self.device_map == "auto":
@@ -718,20 +1312,34 @@ class ILLUMEPlusVisualCoT(lmms):
             if task_type == "maze":
                 # Get step count from ground truth
                 steps_str = doc.get("steps", "[]")
-                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                steps = (
+                    json_module.loads(steps_str)
+                    if isinstance(steps_str, str)
+                    else steps_str
+                )
                 if steps:
                     num_images = len(steps)
             elif task_type == "sliding":
                 # Get step count from ground truth
                 steps_str = doc.get("steps_words", "[]")
-                steps = json_module.loads(steps_str) if isinstance(steps_str, str) else steps_str
+                steps = (
+                    json_module.loads(steps_str)
+                    if isinstance(steps_str, str)
+                    else steps_str
+                )
                 if steps:
                     num_images = len(steps)
 
-        # Extract original image from input_images
-        original_image = None
-        if input_images and len(input_images) > 0:
-            original_image = self._extract_image_from_various_formats(input_images[0])
+        # Extract original images from input_images
+        original_images = []
+        if input_images:
+            for img in input_images:
+                extracted_img = self._extract_image_from_various_formats(img)
+                if extracted_img is not None:
+                    original_images.append(extracted_img)
+
+        # For backward compatibility, use first image as single original_image
+        original_image = original_images[0] if original_images else None
 
         generated_images = []
 
@@ -745,7 +1353,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 generation_prompt=gen_prompt1,
                 doc_id=f"{doc_id}_cand0",
                 task=task,
-                original_image=original_image,
+                original_images=original_images,
             )
             if img_paths_0:
                 generated_images.extend(img_paths_0)
@@ -759,7 +1367,7 @@ class ILLUMEPlusVisualCoT(lmms):
                 generation_prompt=gen_prompt2,
                 doc_id=f"{doc_id}_cand1",
                 task=task,
-                original_image=original_image,
+                original_images=original_images,
             )
             if img_paths_1:
                 generated_images.extend(img_paths_1)
@@ -791,7 +1399,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 conversation = [
                     {
                         "role": "system",
-                        "content": [{"type": "text", "text": "You are a helpful assistant."}],
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ],
                     },
                     {
                         "role": "user",
@@ -803,7 +1413,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 ]
 
                 # Process inputs
-                inputs = self._processor(text=conversation, images=images, return_tensors="pt")
+                inputs = self._processor(
+                    text=conversation, images=images, return_tensors="pt"
+                )
 
                 # Move inputs to appropriate device
                 if self.infer_auto_device_map or self.device_map == "auto":
@@ -822,7 +1434,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 # Decode output
                 input_len = inputs["input_ids"].shape[1]
                 generated_ids = output_ids[0][input_len:]
-                final_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                final_text = self.tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                )
 
                 # Clean up
                 del inputs, output_ids, generated_ids
@@ -835,9 +1449,9 @@ class ILLUMEPlusVisualCoT(lmms):
             for i in range(1, num_images + 1):
                 # Generate step image with planning prompt
                 if task_type == "maze":
-                    plan_suffix = f'Step {i}: Generate an image showing the next move (one step up/down/left/right).'
+                    plan_suffix = f"Step {i}: Generate an image showing the next move (one step up/down/left/right)."
                 else:  # sliding
-                    plan_suffix = f'Step {i}: Generate an image showing which tile to move and in which direction.'
+                    plan_suffix = f"Step {i}: Generate an image showing which tile to move and in which direction."
 
                 gen_prompt = prompt + "\n\n" + plan_suffix
 
@@ -845,7 +1459,7 @@ class ILLUMEPlusVisualCoT(lmms):
                     generation_prompt=gen_prompt,
                     doc_id=f"{doc_id}_step_{i:04d}",
                     task=task,
-                    original_image=original_image,
+                    original_images=original_images,
                 )
 
                 if img_paths:
@@ -862,7 +1476,9 @@ class ILLUMEPlusVisualCoT(lmms):
             # Use custom stage 2 logic with all step images
             if generated_images:
                 # Load all generated images
-                step_images = [Image.open(img_path).convert("RGB") for img_path in generated_images]
+                step_images = [
+                    Image.open(img_path).convert("RGB") for img_path in generated_images
+                ]
 
                 # Build images list
                 images = []
@@ -877,7 +1493,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 conversation = [
                     {
                         "role": "system",
-                        "content": [{"type": "text", "text": "You are a helpful assistant."}],
+                        "content": [
+                            {"type": "text", "text": "You are a helpful assistant."}
+                        ],
                     },
                     {
                         "role": "user",
@@ -889,7 +1507,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 ]
 
                 # Process inputs
-                inputs = self._processor(text=conversation, images=images, return_tensors="pt")
+                inputs = self._processor(
+                    text=conversation, images=images, return_tensors="pt"
+                )
 
                 # Move inputs to appropriate device
                 if self.infer_auto_device_map or self.device_map == "auto":
@@ -908,7 +1528,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 # Decode output
                 input_len = inputs["input_ids"].shape[1]
                 generated_ids = output_ids[0][input_len:]
-                final_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+                final_text = self.tokenizer.decode(
+                    generated_ids, skip_special_tokens=True
+                )
 
                 # Clean up
                 del inputs, output_ids, generated_ids
@@ -970,7 +1592,9 @@ class ILLUMEPlusVisualCoT(lmms):
                 if doc_to_visual[0]:
                     visuals = doc_to_visual[0](doc)
                     if visuals:
-                        input_images = visuals if isinstance(visuals, list) else [visuals]
+                        input_images = (
+                            visuals if isinstance(visuals, list) else [visuals]
+                        )
 
                 # Generate using interleaved mode
                 final_answer, generated_images = self.generate_uni_mmmu_interleaved(
@@ -995,18 +1619,23 @@ class ILLUMEPlusVisualCoT(lmms):
                 pbar.update(1)
                 continue
 
-            # Standard single-image generation mode
-            # Extract original image
-            original_image = None
+            # Standard generation mode
+            # Extract original images (support multiple images)
+            original_images = None
             if doc_to_visual[0]:
                 try:
                     visuals = doc_to_visual[0](self.task_dict[task][split][doc_id])
                     if visuals:
-                        original_image = visuals[0]
-                        eval_logger.debug(f"Extracted original image for doc {doc_id}")
+                        # Support both single image and list of images
+                        original_images = (
+                            visuals if isinstance(visuals, list) else [visuals]
+                        )
+                        eval_logger.debug(
+                            f"Extracted {len(original_images)} original image(s) for doc {doc_id}"
+                        )
                 except Exception as e:
                     eval_logger.warning(
-                        f"Failed to extract original image for doc {doc_id}: {e}"
+                        f"Failed to extract original images for doc {doc_id}: {e}"
                     )
 
             # Parse contexts to extract generation_prompt if provided
@@ -1041,22 +1670,24 @@ class ILLUMEPlusVisualCoT(lmms):
                     question=contexts
                 )
 
-            eval_logger.info(f"\n{'='*60}")
+            eval_logger.info(f"\n{'=' * 60}")
             eval_logger.info(f"Processing doc {doc_id} from task {task}")
-            eval_logger.info(f"{'='*60}")
+            eval_logger.info(f"{'=' * 60}")
 
             # Stage 1: Generate visualization image
             stage1_text, generated_images = self._stage1_generate_image(
                 generation_prompt=generation_prompt,
                 doc_id=doc_id,
                 task=task,
-                original_image=original_image,
+                original_images=original_images,
             )
 
             # Stage 2: Answer with both images
+            # Use the first original image for stage 2 (for backward compatibility)
+            original_image_for_stage2 = original_images[0] if original_images else None
             if generated_images:
                 final_answer = self._stage2_answer_with_images(
-                    contexts, generated_images[0], original_image
+                    contexts, generated_images[0], original_image_for_stage2
                 )
             else:
                 eval_logger.warning(
