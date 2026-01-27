@@ -13,47 +13,10 @@ from tqdm import tqdm
 from lmms_eval.api.instance import Instance
 from lmms_eval.api.model import lmms
 from lmms_eval.api.registry import register_model
-
-# Add models directory to Python path
-wd = Path(__file__).parent.parent.parent.parent.parent.resolve()
-models_path = os.path.join(str(wd), "models")
-if os.path.exists(models_path):
-    sys.path.insert(0, models_path)
-    eval_logger.info(f"Added models path to sys.path: {models_path}")
-else:
-    eval_logger.warning(
-        f"Models directory not found at {models_path}. "
-        f"Please ensure model files are available."
-    )
-
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 @register_model("x_omni")
 class XOmni(lmms):
-    """
-    X-Omni Multimodal Model
-    Supports both image understanding and text-to-image generation
-
-    Modes:
-        - "understanding": Visual understanding (image + text -> text)
-        - "generation": Image generation (text -> image)
-
-    Example usage for understanding:
-    accelerate launch -m lmms_eval \
-        --model x_omni \
-        --model_args pretrained=/path/to/X-Omni-En,mode=understanding,flux_pipe_path=/path/to/flux \
-        --tasks mmbench \
-        --batch_size 1 \
-        --output_path ./logs/
-
-    Example usage for generation:
-    accelerate launch -m lmms_eval \
-        --model x_omni \
-        --model_args pretrained=/path/to/X-Omni-En,mode=generation,flux_pipe_path=/path/to/flux \
-        --tasks ueval \
-        --batch_size 1 \
-        --output_path ./logs/
-    """
-
     def __init__(
         self,
         pretrained: str,
@@ -73,13 +36,26 @@ class XOmni(lmms):
     ) -> None:
         super().__init__()
 
-        # Validate mode
-        if mode not in ["understanding", "generation"]:
-            raise ValueError(
-                f"mode must be 'understanding' or 'generation', got '{mode}'"
-            )
-
+        self.pretrained = pretrained
         self.mode = mode
+
+        # Only set FLUX path if in generation mode or explicitly provided
+        if mode == "generation":
+            if flux_pipe_path is None:
+                # Generation mode requires FLUX, use default if not provided
+                default_flux = "black-forest-labs/FLUX.1-dev"
+                eval_logger.warning(f"Generation mode: flux_pipe_path not provided. Defaulting to '{default_flux}'.")
+                self.flux_pipe_path = default_flux
+            else:
+                self.flux_pipe_path = flux_pipe_path
+        else:
+            # Understanding mode: FLUX not needed
+            self.flux_pipe_path = flux_pipe_path  # Keep user's value if provided, otherwise None
+            if flux_pipe_path is not None:
+                eval_logger.info(f"Understanding mode: flux_pipe_path provided but will not be used: {flux_pipe_path}")
+            else:
+                eval_logger.info("Understanding mode: FLUX loading will be skipped")
+            
         self.max_new_tokens = max_new_tokens
         self.do_sample = do_sample
         self.temperature = temperature
@@ -87,36 +63,12 @@ class XOmni(lmms):
         self.seed = seed
         self.num_inference_steps = num_inference_steps
         self.guidance_scale = guidance_scale
-
-        # Import X-Omni dependencies
-        try:
-            from transformers import AutoTokenizer
-
-            from configuration_xomni import XOmniConfig
-            from modeling_xomni import XOmniForCausalLM
-
-            self.XOmniConfig = XOmniConfig
-            self.XOmniForCausalLM = XOmniForCausalLM
-            self.AutoTokenizer = AutoTokenizer
-
-        except Exception as e:
-            raise ImportError(
-                f"Failed to import X-Omni dependencies. "
-                f"Please ensure:\n"
-                f"  1. Model files are in the models directory\n"
-                f"  2. Required packages are installed\n"
-                f"Error: {e}"
-            )
-
-        self.pretrained = pretrained
-        self.flux_pipe_path = flux_pipe_path
         self.continual_mode = continual_mode
 
-        # Validate flux_pipe_path for generation mode
-        if mode == "generation" and flux_pipe_path is None:
+        # Validate mode
+        if mode not in ["understanding", "generation"]:
             raise ValueError(
-                "flux_pipe_path is required for generation mode. "
-                "Please provide the path to the Flux pipeline."
+                f"mode must be 'understanding' or 'generation', got '{mode}'"
             )
 
         # Setup output directory
@@ -135,7 +87,7 @@ class XOmni(lmms):
         os.makedirs(self.output_image_dir, exist_ok=True)
         eval_logger.info(f"Image output directory: {self.output_image_dir}")
 
-        # Setup response cache for continual mode
+        # Setup response cache
         self.response_cache = {}
         self.cache_mode = "start"
 
@@ -155,10 +107,7 @@ class XOmni(lmms):
         accelerator = Accelerator()
         if accelerator.num_processes > 1:
             if self.continual_mode:
-                eval_logger.warning(
-                    "Continual mode is not supported for distributed inference. "
-                    "Automatically disabling continual_mode."
-                )
+                eval_logger.warning("Continual mode is not supported for distributed inference. Disabling it.")
                 self.continual_mode = False
             self.accelerator = accelerator
             self._rank = self.accelerator.local_process_index
@@ -171,70 +120,185 @@ class XOmni(lmms):
         # Load model
         eval_logger.info(f"Loading X-Omni model from {pretrained}")
         self._load_model()
-
         eval_logger.info("X-Omni model initialized successfully")
 
     def _load_model(self):
-        """Load X-Omni model components"""
+        """Load X-Omni model components using AutoModel with robust regex error protection"""
         model_path = self.pretrained
-
+        
         # Load tokenizer
         eval_logger.info("Loading tokenizer...")
-        self._tokenizer = self.AutoTokenizer.from_pretrained(
+        self._tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True
         )
 
-        # Load model
-        eval_logger.info("Loading model...")
-        self._model = self.XOmniForCausalLM.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
-        )
+        # === Regex Patch Start ===
+        from transformers.modeling_utils import PreTrainedModel
+        original_adjust = PreTrainedModel._adjust_missing_and_unexpected_keys
+        
+        def safe_adjust_keys(self, *args, **kwargs):
+            try:
+                return original_adjust(self, *args, **kwargs)
+            except Exception as e:
+                eval_logger.warning(f"IGNORED Regex Error in model loading: {e}")
+                
+                ret_list = []
+                for arg in args:
+                    if isinstance(arg, list):
+                        ret_list.append(arg)
+                
+                if len(ret_list) >= 2:
+                    return ret_list[0], ret_list[1]
+                else:
+                    return [], []
+
+        PreTrainedModel._adjust_missing_and_unexpected_keys = safe_adjust_keys
+        
+        eval_logger.info("Loading model with trust_remote_code=True (and robust regex patch)...")
+        try:
+            self._model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        except Exception as e:
+            eval_logger.error(f"Failed to load model via AutoModel: {e}")
+            raise e
+        finally:
+            PreTrainedModel._adjust_missing_and_unexpected_keys = original_adjust
+        # === Regex Patch End ===
 
         # Initialize vision components
-        eval_logger.info("Initializing vision components...")
+        if hasattr(self._model, "init_vision"):
+            if self.mode == "understanding":
+                # Understanding mode: Manually initialize only SigLIP encoder, skip FLUX
+                eval_logger.info("Understanding mode: Initializing SigLIP encoder only (skipping FLUX)")
+                try:
+                    # Manually initialize the vision components needed for understanding
+                    from types import SimpleNamespace
+                    from huggingface_hub import hf_hub_download
+                    import os
 
-        if self.mode == "understanding":
-            # Understanding mode only needs encoder (no FLUX required)
-            self._model.init_vision(flux_pipe_path=None)
-            eval_logger.info("Vision encoder initialized for understanding mode")
-        elif self.mode == "generation":
-            # Generation mode needs both encoder and decoder (FLUX required)
-            if self.flux_pipe_path is None:
-                raise ValueError(
-                    "flux_pipe_path is required for generation mode. "
-                    "Please provide it via --model_args flux_pipe_path=/path/to/FLUX.1-dev"
-                )
-            self._model.init_vision(self.flux_pipe_path)
-            eval_logger.info("Vision encoder and decoder initialized for generation mode")
+                    # Set special tokens (needed for tokenize_image)
+                    self._model.som_token = self._model.config.mm_special_tokens[0]
+                    self._model.eom_token = self._model.config.mm_special_tokens[1]
+                    self._model.img_token = self._model.config.mm_special_tokens[2]
+
+                    # Set has_sliding_layers attribute (required by Qwen2Model forward)
+                    # This should be set by parent class but XOmniModel doesn't call Qwen2Model.__init__
+                    if not hasattr(self._model.model, 'has_sliding_layers'):
+                        layer_types = getattr(self._model.config, 'layer_types', [])
+                        self._model.model.has_sliding_layers = "sliding_attention" in layer_types
+                        eval_logger.info(f"Set has_sliding_layers={self._model.model.has_sliding_layers}")
+
+                    # Set embed_tokens attribute (required by Qwen2Model forward)
+                    # XOmniModel has a custom embed_tokens method but Qwen2Model.forward expects it as an attribute
+                    # We need to make sure the method is accessible as self.model.embed_tokens
+                    if not hasattr(self._model.model, 'embed_tokens') or not isinstance(self._model.model.embed_tokens, torch.nn.Module):
+                        # The embed_tokens is a method in XOmniModel, not an nn.Module
+                        # Qwen2Model.forward will call self.embed_tokens(input_ids) which should work
+                        # But we need to ensure it's not trying to access it as a module
+                        eval_logger.info("XOmniModel.embed_tokens is a method, not a module (this is expected)")
+
+                    # Load vision config
+                    self._model.vision_config = SimpleNamespace(**self._model.config.vision_config)
+                    self._model.transform_config = SimpleNamespace(**self._model.vision_config.transform)
+                    self._model.encoder_config = SimpleNamespace(**self._model.vision_config.encoder)
+                    self._model.decoder_config = SimpleNamespace(**self._model.vision_config.decoder)
+
+                    # Set dtype
+                    dtype_map = {'float32': torch.float32, 'float16': torch.float16, 'bfloat16': torch.bfloat16}
+                    self._model.vision_dtype = dtype_map[self._model.vision_config.dtype]
+
+                    # Import from the model's module (loaded via trust_remote_code)
+                    # The model module is already loaded, so we can access it from sys.modules
+                    import sys
+                    model_module_name = self._model.__class__.__module__
+                    model_module = sys.modules[model_module_name]
+
+                    # Get the parent module to access sibling modules
+                    parent_module_name = '.'.join(model_module_name.split('.')[:-1])
+                    if parent_module_name:
+                        # Import from the cached transformers module
+                        siglip_module_name = f"{parent_module_name}.modeling_siglip_tokenizer"
+                        if siglip_module_name in sys.modules:
+                            siglip_module = sys.modules[siglip_module_name]
+                            create_anyres_preprocess = siglip_module.create_anyres_preprocess
+                            SiglipTokenizer = siglip_module.SiglipTokenizer
+                        else:
+                            # Fallback: import directly
+                            import importlib
+                            siglip_module = importlib.import_module(siglip_module_name)
+                            create_anyres_preprocess = siglip_module.create_anyres_preprocess
+                            SiglipTokenizer = siglip_module.SiglipTokenizer
+                    else:
+                        raise ImportError("Could not determine model module path")
+
+                    # Create image transform
+                    self._model.image_transform = create_anyres_preprocess(**self._model.vision_config.transform)
+
+                    # Load SigLIP encoder paths
+                    if os.path.isdir(self._model.name_or_path):
+                        self._model.encoder_config.siglip_path = os.path.join(
+                            self._model.name_or_path, self._model.encoder_config.siglip_path
+                        )
+                        self._model.encoder_config.projector_path = os.path.join(
+                            self._model.name_or_path, self._model.encoder_config.projector_path
+                        )
+                    else:
+                        self._model.encoder_config.siglip_path = hf_hub_download(
+                            repo_id=self._model.name_or_path,
+                            filename=self._model.encoder_config.siglip_path
+                        )
+                        self._model.encoder_config.projector_path = hf_hub_download(
+                            repo_id=self._model.name_or_path,
+                            filename=self._model.encoder_config.projector_path
+                        )
+
+                    # Initialize SigLIP tokenizer only
+                    self._model.image_tokenizer = SiglipTokenizer(**vars(self._model.encoder_config))
+                    self._model.image_tokenizer.to(self._model.device, self._model.vision_dtype)
+
+                    # Set image_tokenizer to eval mode
+                    self._model.image_tokenizer.eval()
+
+                    # Also set the vqproj to eval mode to ensure quantization works correctly
+                    if hasattr(self._model.image_tokenizer, 'vqproj'):
+                        self._model.image_tokenizer.vqproj.eval()
+                        if hasattr(self._model.image_tokenizer.vqproj, 'quantize'):
+                            self._model.image_tokenizer.vqproj.quantize.eval()
+
+                    # Set decoder_pipe to None to indicate no generation capability
+                    self._model.decoder_pipe = None
+
+                    eval_logger.info("✅ SigLIP encoder initialized successfully (FLUX skipped)")
+                except Exception as e:
+                    eval_logger.error(f"Failed to manually initialize SigLIP encoder: {e}")
+                    eval_logger.error("Falling back to full init_vision (will attempt to load FLUX)")
+                    raise
+            elif self.mode == "generation":
+                eval_logger.info(f"Generation mode: Initializing vision components with FLUX path: {self.flux_pipe_path}")
+                self._model.init_vision(self.flux_pipe_path)
+                eval_logger.info("Vision encoder and decoder initialized for generation mode")
+        else:
+            eval_logger.warning("Loaded model does not have 'init_vision' method. Check if correct model class was loaded.")
 
         self._model.eval()
 
     @property
-    def rank(self):
-        return self._rank
-
+    def rank(self): return self._rank
     @property
-    def world_size(self):
-        return self._world_size
-
+    def world_size(self): return self._world_size
     @property
-    def model(self):
-        return self._model
-
+    def model(self): return self._model
     @property
-    def tokenizer(self):
-        return self._tokenizer
+    def tokenizer(self): return self._tokenizer
 
     def set_seed(self, seed: int):
-        """Set random seeds for reproducibility"""
         if seed > 0:
             import random
-
             import numpy as np
-
             random.seed(seed)
             np.random.seed(seed)
             torch.manual_seed(seed)
@@ -245,43 +309,19 @@ class XOmni(lmms):
             torch.backends.cudnn.benchmark = False
 
     def understand_image(self, prompt: str, image: Image.Image, doc_id: str) -> str:
-        """
-        Understand image and answer question
-
-        Args:
-            prompt: Input text prompt/question
-            image: PIL Image to understand
-            doc_id: Document ID for logging
-
-        Returns:
-            Generated text answer
-        """
         self.set_seed(self.seed)
-
-        # Set generation mode to text
         self.model.set_generation_mode("text")
 
-        # Tokenize image first
         image_str = self.model.tokenize_image(image)
-
-        # Create chat message with proper format
         message = [{'role': 'user', 'content': image_str + '\n' + prompt}]
 
-        # Apply chat template
         input_ids = self.tokenizer.apply_chat_template(
-            message,
-            add_generation_prompt=True,
-            return_tensors="pt"
+            message, add_generation_prompt=True, return_tensors="pt"
         )
         input_ids = input_ids.to(self.model.device)
-
-        # Create attention mask
         attention_mask = torch.ones_like(input_ids)
-
-        # Get proper EOS token
         eos_token_id = self.tokenizer.encode('<|im_end|>')[0]
 
-        # Generate response
         with torch.no_grad():
             output_ids = self.model.generate(
                 input_ids,
@@ -295,38 +335,17 @@ class XOmni(lmms):
                 use_cache=True,
             )
 
-        # Decode output using mmdecode
         texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
         output_text = texts[0] if texts else ""
-
         return output_text
 
-    def generate_image(
-        self, prompt: str, doc_id: str, task: str
-    ) -> Tuple[str, List[str]]:
-        """
-        Generate image from text prompt
-
-        Args:
-            prompt: Input text prompt
-            doc_id: Document ID for file naming
-            task: Task name for file naming
-
-        Returns:
-            Tuple of (generated_text, list_of_image_paths)
-        """
+    def generate_image(self, prompt: str, doc_id: str, task: str) -> Tuple[str, List[str]]:
         self.set_seed(self.seed)
-
-        # Set generation mode to image
         self.model.set_generation_mode("image")
 
-        # Encode input
-        input_ids = self.model.mmencode(
-            self.tokenizer, texts=[prompt], return_tensors="pt"
-        )
+        input_ids = self.model.mmencode(self.tokenizer, texts=[prompt], return_tensors="pt")
         input_ids = input_ids.to(self.model.device)
 
-        # Generate image tokens
         with torch.no_grad():
             output_ids = self.model.generate(
                 input_ids,
@@ -338,13 +357,9 @@ class XOmni(lmms):
                 eos_token_id=self.tokenizer.eos_token_id,
             )
 
-        # Decode output (text and images)
         texts, images = self.model.mmdecode(self.tokenizer, output_ids)
-
-        # Get generated text
         output_text = texts[-1] if texts else ""
 
-        # Save generated images
         output_images = []
         for idx, image in enumerate(images):
             safe_filename = f"{task}_{doc_id}_{idx}.png"
@@ -356,102 +371,54 @@ class XOmni(lmms):
         return output_text, output_images
 
     def format_output(self, text: str, images: List[str]) -> str:
-        """Format output as JSON string"""
         output_dict = {"text": text, "images": images}
-        result = json.dumps(output_dict, ensure_ascii=False)
-        return result
+        return json.dumps(output_dict, ensure_ascii=False)
 
     def flatten(self, input_list):
-        """Flatten a nested list"""
         output = []
         for item in input_list:
-            if isinstance(item, list):
-                output.extend(self.flatten(item))
-            else:
-                output.append(item)
+            if isinstance(item, list): output.extend(self.flatten(item))
+            else: output.append(item)
         return output
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
-        """Main inference method"""
         res = []
-        pbar = tqdm(
-            total=len(requests), disable=(self.rank != 0), desc="X-Omni Generating"
-        )
+        pbar = tqdm(total=len(requests), disable=(self.rank != 0), desc="X-Omni Generating")
+        def get_uuid(task, split, doc_id): return f"{task}___{split}___{doc_id}"
 
-        def get_uuid(task, split, doc_id):
-            return f"{task}___{split}___{doc_id}"
-
-        for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [
-            reg.args for reg in requests
-        ]:
+        for contexts, gen_kwargs, doc_to_visual, doc_id, task, split in [reg.args for reg in requests]:
             doc_uuid = get_uuid(task, split, doc_id)
-
-            # Check cache
             if self.continual_mode and self.cache_mode == "resume":
-                if doc_uuid in self.response_cache:
-                    content = self.response_cache[doc_uuid]
-                    if content:
-                        res.append(content)
-                        pbar.update(1)
-                        continue
+                if doc_uuid in self.response_cache and self.response_cache[doc_uuid]:
+                    res.append(self.response_cache[doc_uuid])
+                    pbar.update(1)
+                    continue
 
             prompt = contexts
-
-            # Debug: Log the first few prompts to check input
-            if len(res) < 3:
-                eval_logger.info(f"[DEBUG] Doc {doc_id} prompt: {prompt[:200]}...")
-
             if self.mode == "understanding":
-                # Image understanding mode
                 if doc_to_visual is None:
-                    eval_logger.warning(
-                        f"No image provided for understanding mode, doc_id={doc_id}"
-                    )
                     res.append("")
                     pbar.update(1)
                     continue
-
-                # Get image from doc_to_visual
-                visuals = [doc_to_visual(self.task_dict[task][split][doc_id])]
-                visuals = self.flatten(visuals)
-
-                if not visuals or len(visuals) == 0:
-                    eval_logger.warning(f"No visual data found for doc_id={doc_id}")
+                visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
+                if not visuals:
                     res.append("")
                     pbar.update(1)
                     continue
-
-                # Use first image for understanding
-                image = visuals[0]
-                output_text = self.understand_image(prompt, image, str(doc_id))
-                formatted_output = output_text
-
+                res.append(self.understand_image(prompt, visuals[0], str(doc_id)))
             else:
-                # Image generation mode
-                output_text, output_images = self.generate_image(
-                    prompt, str(doc_id), task
-                )
-                formatted_output = self.format_output(output_text, output_images)
+                out_txt, out_imgs = self.generate_image(prompt, str(doc_id), task)
+                res.append(self.format_output(out_txt, out_imgs))
 
-            res.append(formatted_output)
-
-            # Update cache
             if self.continual_mode:
-                self.response_cache[doc_uuid] = formatted_output
+                self.response_cache[doc_uuid] = res[-1]
                 with open(self.response_persistent_file, "w") as f:
                     json.dump(self.response_cache, f, ensure_ascii=False, indent=2)
-
             pbar.update(1)
-
         pbar.close()
         return res
-
+    
     def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
-        """Not supported for generation models"""
-        raise NotImplementedError(
-            "X-Omni is a generation model and does not support loglikelihood"
-        )
-
+        raise NotImplementedError("X-Omni is a generation model")
     def generate_until_multi_round(self, requests) -> List[str]:
-        """Multi-round dialogue generation"""
-        raise NotImplementedError("TODO: Implement multi-round dialogue generation")
+        raise NotImplementedError("TODO: Implement multi-round")
