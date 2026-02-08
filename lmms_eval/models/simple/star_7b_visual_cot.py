@@ -464,6 +464,59 @@ class STAR7BVisualCoT(lmms):
                 output.append(item)
         return output
 
+    def _concatenate_images_horizontally(self, images: List[Image.Image], max_width: int = 2048) -> Image.Image:
+        """
+        Concatenate multiple images horizontally into a single image.
+        
+        Args:
+            images: List of PIL Images
+            max_width: Maximum width for the concatenated image
+            
+        Returns:
+            Single concatenated PIL Image
+        """
+        if not images:
+            return None
+        
+        if len(images) == 1:
+            return images[0]
+        
+        # Calculate target height (use the minimum height to avoid distortion)
+        min_height = min(img.height for img in images)
+        
+        # Resize all images to the same height while maintaining aspect ratio
+        resized_images = []
+        total_width = 0
+        for img in images:
+            aspect_ratio = img.width / img.height
+            new_width = int(min_height * aspect_ratio)
+            resized_img = img.resize((new_width, min_height), Image.Resampling.LANCZOS)
+            resized_images.append(resized_img)
+            total_width += new_width
+        
+        # If total width exceeds max_width, scale down proportionally
+        if total_width > max_width:
+            scale_factor = max_width / total_width
+            new_height = int(min_height * scale_factor)
+            resized_images = []
+            total_width = 0
+            for img in images:
+                aspect_ratio = img.width / img.height
+                new_width = int(new_height * aspect_ratio)
+                resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                resized_images.append(resized_img)
+                total_width += new_width
+            min_height = new_height
+        
+        # Create concatenated image
+        concat_img = Image.new('RGB', (total_width, min_height))
+        x_offset = 0
+        for img in resized_images:
+            concat_img.paste(img, (x_offset, 0))
+            x_offset += img.width
+        
+        return concat_img
+
     def _stage1_generate_image(
         self, generation_prompt: str, doc_id: str, task: str, original_image=None
     ) -> Tuple[str, List[str]]:
@@ -474,17 +527,18 @@ class STAR7BVisualCoT(lmms):
             generation_prompt: Text prompt for image generation/editing
             doc_id: Document ID for file naming
             task: Task name for file naming
-            original_image: Original image to condition on (optional)
-                - If provided: Uses STAR's image editing (i2i) capability
+            original_image: Original image(s) to condition on (optional)
+                - Single image (PIL.Image or other format): Uses STAR's image editing (i2i)
+                - List of images: Concatenates horizontally then uses i2i editing
                 - If None: Uses STAR's text-to-image generation
 
         Returns:
             Tuple of (generated_text, list_of_image_paths)
         
         Note:
-            STAR supports both text-to-image generation and image-to-image editing.
-            When original_image is provided, it uses generate_images_edit for better
-            context-aware visualization generation.
+            For multi-image inputs (like MSR task), images are concatenated horizontally
+            into a single image before passing to generate_images_edit, since STAR's
+            editing mode only supports single image input.
         """
         eval_logger.debug(f"Stage 1 - Generating image for doc {doc_id}")
         eval_logger.debug(f"Generation prompt: {generation_prompt}")
@@ -492,32 +546,80 @@ class STAR7BVisualCoT(lmms):
         try:
             self.set_seed(self.seed)
 
-            # Convert original_image to PIL Image if provided
-            pil_image = None
+            # Convert original_image to PIL Image(s) if provided
+            pil_images = []
+            original_pil_images = []  # Keep original images for Stage 2
             if original_image is not None:
-                pil_image = self._extract_image_from_various_formats(original_image)
-                if pil_image is not None:
-                    eval_logger.debug("Stage 1 - Using image editing mode (i2i) with original image")
+                if isinstance(original_image, list):
+                    # Multiple images - extract all
+                    for img in original_image:
+                        pil_img = self._extract_image_from_various_formats(img)
+                        if pil_img is not None:
+                            pil_images.append(pil_img)
+                            original_pil_images.append(pil_img)
+                    if pil_images:
+                        eval_logger.debug(f"Stage 1 - Extracted {len(pil_images)} original images")
+                    else:
+                        eval_logger.warning("Stage 1 - Failed to extract any images from list, falling back to text-to-image")
                 else:
-                    eval_logger.warning("Stage 1 - Failed to extract original image, falling back to text-to-image")
+                    # Single image
+                    pil_img = self._extract_image_from_various_formats(original_image)
+                    if pil_img is not None:
+                        pil_images = [pil_img]
+                        original_pil_images = [pil_img]
+                        eval_logger.debug("Stage 1 - Extracted single original image")
+                    else:
+                        eval_logger.warning("Stage 1 - Failed to extract original image, falling back to text-to-image")
 
-            # Choose generation method based on whether we have an input image
+            # Choose generation method based on whether we have input images
             with torch.no_grad():
-                if pil_image is not None:
-                    # Image-to-image editing mode
-                    # STAR's generate_images_edit expects a list of images
-                    output = self._star_model.generate_images_edit(
-                        image=[pil_image],  # Wrap single image in list
-                        prompt=generation_prompt,
-                        max_new_tokens=self.stage1_vq_tokens,
-                        num_return_sequences=1,
-                        cfg_weight=self.stage1_cfg,
-                        topk_sample=self.stage1_topk,
-                        topp_sample=self.stage1_topp,
-                        return_dict=True,
-                    )
+                if pil_images:
+                    # For multiple images, concatenate them horizontally
+                    if len(pil_images) > 1:
+                        eval_logger.info(f"Stage 1 - Concatenating {len(pil_images)} images horizontally for i2i editing")
+                        concat_image = self._concatenate_images_horizontally(pil_images)
+                        if concat_image is None:
+                            eval_logger.error("Stage 1 - Failed to concatenate images, falling back to text-to-image")
+                            pil_images = []
+                        else:
+                            pil_images = [concat_image]
+                            eval_logger.info(f"Stage 1 - Concatenated image size: {concat_image.size}")
+                            
+                            # Save concatenated image for debugging
+                            if self.save_intermediate:
+                                task_dir = os.path.join(self.generated_images_dir, task)
+                                os.makedirs(task_dir, exist_ok=True)
+                                concat_path = os.path.join(task_dir, f"{doc_id}_concat_input.png")
+                                concat_image.save(concat_path)
+                                eval_logger.info(f"Stage 1 - Saved concatenated input image: {concat_path}")
+                    
+                    if pil_images:
+                        # Image-to-image editing mode with single (possibly concatenated) image
+                        eval_logger.debug("Stage 1 - Using image editing mode (i2i)")
+                        output = self._star_model.generate_images_edit(
+                            image=pil_images,
+                            prompt=generation_prompt,
+                            max_new_tokens=self.stage1_vq_tokens,
+                            num_return_sequences=1,
+                            cfg_weight=self.stage1_cfg,
+                            topk_sample=self.stage1_topk,
+                            topp_sample=self.stage1_topp,
+                            return_dict=True,
+                        )
+                    else:
+                        # Fallback to text-to-image if concatenation failed
+                        output = self._star_model.generate_images(
+                            generation_prompt,
+                            max_new_tokens=self.stage1_vq_tokens,
+                            num_return_sequences=1,
+                            cfg_weight=self.stage1_cfg,
+                            topk_sample=self.stage1_topk,
+                            topp_sample=self.stage1_topp,
+                            return_dict=True,
+                        )
                 else:
                     # Text-to-image generation mode
+                    eval_logger.debug("Stage 1 - Using text-to-image generation mode")
                     output = self._star_model.generate_images(
                         generation_prompt,
                         max_new_tokens=self.stage1_vq_tokens,
@@ -574,16 +676,17 @@ class STAR7BVisualCoT(lmms):
                 raise
 
     def _stage2_answer_with_image(
-        self, question: str, image_path: str, doc_id: str, original_image: Optional[Image.Image] = None
+        self, question: str, image_path: str, doc_id: str, original_image=None
     ) -> str:
         """
-        Stage 2: Answer question using generated image (and optionally original image)
+        Stage 2: Answer question using generated image (and optionally original image(s))
 
         Args:
             question: Original question text
             image_path: Path to generated auxiliary image
             doc_id: Document ID for logging
-            original_image: Original image (optional, used as primary reference)
+            original_image: Original image(s) (optional, used as primary reference)
+                - Can be a single image or a list of images
 
         Returns:
             Answer text
@@ -591,7 +694,7 @@ class STAR7BVisualCoT(lmms):
         Note:
             This method supports multi-image input through the patched inference_understand.
             When original_image is provided, both original and generated images are used.
-            Images are processed in order: [original_image, auxiliary_image]
+            Images are processed in order: [original_image(s), auxiliary_image]
         """
         eval_logger.debug(f"Stage 2 - Answering question for doc {doc_id}")
         eval_logger.debug(f"Question: {question}")
@@ -604,17 +707,28 @@ class STAR7BVisualCoT(lmms):
 
             # Prepare images list for multi-image input
             images = []
-            if original_image is not None:
-                eval_logger.debug("Stage 2 - Using both original and auxiliary images")
-                # Convert original_image if needed
-                if not isinstance(original_image, Image.Image):
-                    original_image = self._extract_image_from_various_formats(original_image)
-                if original_image is not None:
-                    images.append(original_image)
             
+            if original_image is not None:
+                if isinstance(original_image, list):
+                    # Multiple original images
+                    eval_logger.debug(f"Stage 2 - Processing {len(original_image)} original images")
+                    for img in original_image:
+                        if not isinstance(img, Image.Image):
+                            img = self._extract_image_from_various_formats(img)
+                        if img is not None:
+                            images.append(img)
+                else:
+                    # Single original image
+                    eval_logger.debug("Stage 2 - Using single original image")
+                    if not isinstance(original_image, Image.Image):
+                        original_image = self._extract_image_from_various_formats(original_image)
+                    if original_image is not None:
+                        images.append(original_image)
+            
+            # Add auxiliary image
             images.append(auxiliary_image)
             
-            eval_logger.debug(f"Stage 2 - Processing with {len(images)} image(s)")
+            eval_logger.debug(f"Stage 2 - Processing with {len(images)} image(s) total")
 
             # Use patched inference_understand with multiple images
             # If only one image, pass it directly; if multiple, pass as list
@@ -944,7 +1058,7 @@ class STAR7BVisualCoT(lmms):
                 continue
 
             # Standard single-image generation mode
-            # Extract original image from document
+            # Extract original image(s) from document
             original_image = None
             if doc_to_visual is not None:
                 try:
@@ -952,10 +1066,11 @@ class STAR7BVisualCoT(lmms):
                     if isinstance(visuals, list):
                         visuals = self.flatten(visuals)
                         if visuals and len(visuals) > 0:
-                            original_image = visuals[0]
+                            # Keep all images for multi-image tasks like MSR
+                            original_image = visuals if len(visuals) > 1 else visuals[0]
+                            eval_logger.debug(f"Extracted {len(visuals) if isinstance(visuals, list) else 1} original image(s) for doc {doc_id}")
                     elif visuals is not None:
                         original_image = visuals
-                    if original_image is not None:
                         eval_logger.debug(f"Extracted original image for doc {doc_id}")
                 except Exception as e:
                     eval_logger.warning(f"Failed to extract original image for doc {doc_id}: {e}")
