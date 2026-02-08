@@ -79,9 +79,9 @@ class STAR7BVisualCoT(lmms):
         # Stage 1: Image generation parameters
         stage1_vq_image_size: int = 384,
         stage1_vq_tokens: int = 576,
-        stage1_topk: int = 2000,
-        stage1_cfg: float = 20.0,
-        stage1_topp: float = 1.0,
+        stage1_topk: int = 1000,  # Changed from 2000 to 1000 (README default)
+        stage1_cfg: float = 1.1,  # Changed from 20.0 to 1.1 (README default)
+        stage1_topp: float = 0.8,  # Changed from 1.0 to 0.8 (README default)
         # Stage 2: Visual understanding parameters
         stage2_max_new_tokens: int = 512,
         # Generation prompt template
@@ -101,8 +101,9 @@ class STAR7BVisualCoT(lmms):
         min_pixels: int = 28 * 28 * 16,
         max_seq_length: int = 8192,
         max_text_tokens: int = 512,
+        max_diff_seq_length: int = 256,  # Maximum diffusion sequence length
         grad_ckpt: bool = False,
-        diffusion_as_decoder: bool = False,
+        diffusion_as_decoder: bool = True,  # Disable diffusion decoder for now, test VQ first
         diffusion_resolution: int = 1024,
         ori_inp_dit: str = "seq",
         **kwargs,
@@ -215,6 +216,7 @@ class STAR7BVisualCoT(lmms):
         self.args.min_pixels = min_pixels
         self.args.max_seq_length = max_seq_length
         self.args.max_text_tokens = max_text_tokens
+        self.args.max_diff_seq_length = max_diff_seq_length
         self.args.grad_ckpt = grad_ckpt
         self.args.diffusion_as_decoder = diffusion_as_decoder
         self.args.diffusion_resolution = diffusion_resolution
@@ -640,7 +642,15 @@ class STAR7BVisualCoT(lmms):
                 task_dir = os.path.join(self.generated_images_dir, task)
                 os.makedirs(task_dir, exist_ok=True)
 
-                # Save VQ images
+                # Save diffusion images first if available (higher quality)
+                if diff_images is not None and len(diff_images) > 0:
+                    img_filename = f"{doc_id}_stage1_diff.png"
+                    img_path = os.path.join(task_dir, img_filename)
+                    diff_images[0].save(img_path)
+                    image_paths.append(img_path)
+                    eval_logger.info(f"Stage 1 - Saved diffusion image: {img_path}")
+
+                # Save VQ images as backup
                 if output_images is not None:
                     dec_vq = np.clip((output_images + 1) / 2 * 255, 0, 255)
                     visual_img_vq = np.zeros(
@@ -653,16 +663,10 @@ class STAR7BVisualCoT(lmms):
                     img_filename = f"{doc_id}_stage1_vq.png"
                     img_path = os.path.join(task_dir, img_filename)
                     img.save(img_path)
-                    image_paths.append(img_path)
+                    # Only add VQ image if no diffusion image was generated
+                    if not diff_images:
+                        image_paths.append(img_path)
                     eval_logger.debug(f"Stage 1 - Saved VQ image: {img_path}")
-
-                # Save diffusion images if available
-                if diff_images is not None and len(diff_images) > 0:
-                    img_filename = f"{doc_id}_stage1_diff.png"
-                    img_path = os.path.join(task_dir, img_filename)
-                    diff_images[0].save(img_path)
-                    image_paths.append(img_path)
-                    eval_logger.debug(f"Stage 1 - Saved diffusion image: {img_path}")
 
             output_text = f"Generated {len(image_paths)} images"
             eval_logger.debug(f"Stage 1 - Generated {len(image_paths)} image(s)")
