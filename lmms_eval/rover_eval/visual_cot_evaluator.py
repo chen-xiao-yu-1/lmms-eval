@@ -210,34 +210,49 @@ def evaluate_from_json(
     metrics: List[str] = None,
     task_category: Optional[str] = None,
     max_retries: int = 3,
+    base_dir: Optional[str] = None,
 ) -> Dict:
     """
     Evaluate Visual CoT from JSON metadata file.
-    
+
     Args:
         json_path: Path to JSON metadata file
         original_image: Path to original question image(s) - can be single image or list of images
         metrics: List of metrics to evaluate ["ra", "al"] (default: both)
         task_category: Optional task category for customized prompts
         max_retries: Max retry attempts
-        
+        base_dir: Base directory for resolving relative paths in generated_images
+
     Returns:
         Dict with all evaluation results
     """
     # Load metadata
     metadata = load_metadata_json(json_path)
-    
+
     doc_id = str(metadata.get("doc_id", "unknown"))
     task = metadata.get("task", "unknown")
     generation_prompt = metadata.get("generation_prompt", "")
     generated_images = metadata.get("generated_images", [])
     question = metadata.get("question", "")
     answer = metadata.get("stage2_answer", "")
-    
+
+    # Resolve relative paths in generated_images
+    if base_dir is not None:
+        resolved_images = []
+        for img_path in generated_images:
+            if isinstance(img_path, str):
+                # Handle relative paths like ./logs/... or logs/...
+                if img_path.startswith("./"):
+                    img_path = img_path[2:]  # Remove ./
+                if not Path(img_path).is_absolute():
+                    img_path = str(Path(base_dir) / img_path)
+            resolved_images.append(img_path)
+        generated_images = resolved_images
+
     # Default to both metrics
     if metrics is None:
         metrics = ["ra", "al"]
-    
+
     results = {
         "doc_id": doc_id,
         "task": task,
@@ -284,10 +299,11 @@ def evaluate_batch_from_jsons(
     task_category: Optional[str] = None,
     max_retries: int = 3,
     max_workers: int = 10,
+    base_dir: Optional[str] = None,
 ) -> List[Dict]:
     """
     Evaluate multiple Visual CoT samples from JSON files.
-    
+
     Args:
         json_paths: List of JSON file paths
         original_images: List of original image paths (same order as json_paths) - each can be single image or list of images
@@ -295,18 +311,20 @@ def evaluate_batch_from_jsons(
         task_category: Optional task category for customized prompts
         max_retries: Max retry attempts
         max_workers: Max parallel workers
-        
+        base_dir: Base directory for resolving relative paths in generated_images
+
     Returns:
         List of evaluation results
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
     from tqdm import tqdm
-    
+
     if len(json_paths) != len(original_images):
         raise ValueError("json_paths and original_images must have same length")
-    
+
     results = []
-    
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(
@@ -316,10 +334,11 @@ def evaluate_batch_from_jsons(
                 metrics,
                 task_category,
                 max_retries,
+                base_dir,
             ): (json_path, original_image)
             for json_path, original_image in zip(json_paths, original_images)
         }
-        
+
         for future in tqdm(as_completed(futures), total=len(futures), desc="Evaluating"):
             try:
                 result = future.result()
@@ -331,31 +350,34 @@ def evaluate_batch_from_jsons(
                     "json_path": json_path,
                     "error": str(e),
                 })
-    
+
     return results
 
 
 class VisualCoTEvaluator:
     """Visual CoT Evaluator for ROVER."""
-    
+
     def __init__(
         self,
         metrics: List[str] = None,
         task_category: Optional[str] = None,
         max_retries: int = 3,
+        base_dir: Optional[str] = None,
     ):
         """
         Initialize Visual CoT Evaluator.
-        
+
         Args:
             metrics: List of metrics ["ra", "al"] (default: both)
             task_category: Task category for customized prompts
             max_retries: Max retry attempts per metric
+            base_dir: Base directory for resolving relative paths in generated_images
         """
         self.metrics = metrics or ["ra", "al"]
         self.task_category = task_category
         self.max_retries = max_retries
-    
+        self.base_dir = base_dir
+
     def evaluate_from_json(
         self,
         json_path: str,
@@ -364,12 +386,12 @@ class VisualCoTEvaluator:
     ) -> Dict:
         """
         Evaluate single sample from JSON.
-        
+
         Args:
             json_path: Path to JSON metadata file
             original_image: Original question image(s) - can be single image or list of images
             task_category: Override task category
-            
+
         Returns:
             Evaluation results
         """
@@ -380,8 +402,9 @@ class VisualCoTEvaluator:
             metrics=self.metrics,
             task_category=cat,
             max_retries=self.max_retries,
+            base_dir=self.base_dir,
         )
-    
+
     def evaluate_batch(
         self,
         json_paths: List[str],
@@ -390,12 +413,12 @@ class VisualCoTEvaluator:
     ) -> List[Dict]:
         """
         Evaluate multiple samples from JSON files.
-        
+
         Args:
             json_paths: List of JSON file paths
             original_images: List of original image paths - each can be single image or list of images
             max_workers: Max parallel workers
-            
+
         Returns:
             List of evaluation results
         """
@@ -406,4 +429,5 @@ class VisualCoTEvaluator:
             task_category=self.task_category,
             max_retries=self.max_retries,
             max_workers=max_workers,
+            base_dir=self.base_dir,
         )

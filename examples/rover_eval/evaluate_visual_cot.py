@@ -4,9 +4,25 @@ Visual CoT ROVER 评测示例脚本
 
 用法:
     # 方式1: 从图像目录读取原始图像
+    # 方式1: 从图像目录读取原始图像
     python examples/rover_eval/evaluate_visual_cot.py \
         --log_dir ./logs/bagel_visual_cot/ \
         --image_dir ./dataset/illusionbench/images/ \
+        --output visual_cot_results.csv
+
+    # 方式2: 从 parquet 文件读取原始图像 (适用于 PhyX 等数据集)
+    python examples/rover_eval/evaluate_visual_cot.py \
+        --log_dir ./logs/bagel_visual_cot/phyx_mechanics100_visual_cot/ \
+        --parquet_file /path/to/phyx_mechanics100.parquet \
+        --base_dir /home/aiscuser/data/zwb \
+        --output visual_cot_results.csv
+
+    # 方式3: 从 HuggingFace 加载数据集
+    python examples/rover_eval/evaluate_visual_cot.py \
+        --log_dir ./logs/bagel_visual_cot/geometry3k_visual_cot/ \
+        --hf_dataset zwb20060413/geometry3k \
+        --hf_split test \
+        --base_dir /home/aiscuser/data/zwb \
         --output visual_cot_results.csv
 
     # 方式2: 从 parquet 文件读取原始图像 (适用于 PhyX 等数据集)
@@ -28,9 +44,14 @@ Visual CoT ROVER 评测示例脚本
 import argparse
 import base64
 import io
+import base64
+import io
 import json
 import sys
 from pathlib import Path
+
+from PIL import Image
+
 
 from PIL import Image
 
@@ -229,10 +250,12 @@ def main():
     parser.add_argument("--output", type=str, default="visual_cot_results.csv", help="Output CSV file")
     parser.add_argument("--metrics", nargs="+", default=["ra", "al"], choices=["ra", "al"], help="Metrics to evaluate")
     parser.add_argument("--task_category", type=str, default=None,
+    parser.add_argument("--task_category", type=str, default=None,
                        choices=["real_world", "mathematical", "stem", "puzzles", "chart_table", "spatial", "perception"],
                        help="Task category for customized prompts")
     parser.add_argument("--max_workers", type=int, default=10, help="Max parallel workers")
     parser.add_argument("--max_retries", type=int, default=3, help="Max retries per evaluation")
+
 
     args = parser.parse_args()
 
@@ -241,7 +264,14 @@ def main():
         print("Error: Must specify one of --image_dir, --parquet_file, or --hf_dataset")
         sys.exit(1)
 
+
+    # Validate arguments
+    if args.image_dir is None and args.parquet_file is None and args.hf_dataset is None:
+        print("Error: Must specify one of --image_dir, --parquet_file, or --hf_dataset")
+        sys.exit(1)
+
     log_dir = Path(args.log_dir)
+
 
     if not log_dir.exists():
         print(f"Error: Log directory {log_dir} not found")
@@ -315,23 +345,28 @@ def main():
         print(f"Error: Image directory {image_dir} not found")
         sys.exit(1)
 
+
     # 收集所有 JSON 文件
     json_files = sorted(log_dir.glob("*_metadata.json"))
     print(f"Found {len(json_files)} JSON files in {log_dir}")
+
 
     if len(json_files) == 0:
         print("No JSON files found. Exiting.")
         sys.exit(1)
 
+
     # 准备评测数据
     json_paths = []
     original_images = []
+
 
     for json_file in json_files:
         with open(json_file) as f:
             try:
                 data = json.load(f)
                 doc_id = data.get("doc_id", "unknown")
+
 
                 original_img = None
 
@@ -352,25 +387,52 @@ def main():
                             original_img = str(candidate)
                             break
 
+
+                # 优先从已加载的图像中获取 (HF 或 parquet)
+                if loaded_images is not None:
+                    # doc_id 可能是 int 或 str
+                    doc_id_int = int(doc_id) if isinstance(doc_id, str) and str(doc_id).isdigit() else doc_id
+                    if doc_id_int in loaded_images:
+                        original_img = loaded_images[doc_id_int]
+                    elif doc_id in loaded_images:
+                        original_img = loaded_images[doc_id]
+
+                # 否则从图像目录获取
+                if original_img is None and image_dir is not None:
+                    for ext in [".png", ".jpg", ".jpeg", ".PNG", ".JPG"]:
+                        candidate = image_dir / f"{doc_id}{ext}"
+                        if candidate.exists():
+                            original_img = str(candidate)
+                            break
+
                 if original_img is None:
+                    print(f"Warning: Image for doc_id {doc_id} not found, skipping")
                     print(f"Warning: Image for doc_id {doc_id} not found, skipping")
                     continue
 
+
                 json_paths.append(str(json_file))
+                original_images.append(original_img)
+
                 original_images.append(original_img)
 
             except Exception as e:
                 print(f"Error loading {json_file}: {e}, skipping")
                 continue
 
+
     if len(json_paths) == 0:
         print("No valid samples to evaluate. Exiting.")
         sys.exit(1)
+
 
     print(f"Evaluating {len(json_paths)} samples")
     print(f"  Metrics: {args.metrics}")
     if args.task_category:
         print(f"  Task Category: {args.task_category}")
+    if args.base_dir:
+        print(f"  Base Dir: {args.base_dir}")
+
     if args.base_dir:
         print(f"  Base Dir: {args.base_dir}")
 
