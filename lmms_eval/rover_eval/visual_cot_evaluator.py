@@ -71,7 +71,7 @@ def extract_score_and_reason(response: str, score_key: str) -> tuple:
 def evaluate_reasoning_visual_alignment(
     doc_id: str,
     task: str,
-    original_image: Union[str, Image.Image],
+    original_image: Union[str, Image.Image, List[Union[str, Image.Image]]],
     generated_images: List[Union[str, Image.Image]],
     generation_prompt: str,
     question: str,
@@ -86,7 +86,7 @@ def evaluate_reasoning_visual_alignment(
     Args:
         doc_id: Document ID
         task: Task name
-        original_image: Original question image
+        original_image: Original question image(s) - can be single image or list of images
         generated_images: List of generated visualization images
         generation_prompt: Prompt used to generate images
         question: Original question text
@@ -104,7 +104,11 @@ def evaluate_reasoning_visual_alignment(
     )
     
     # Build image list: original + all generated
-    images = [original_image] + generated_images
+    # Handle both single image and list of images
+    if isinstance(original_image, list):
+        images = original_image + generated_images
+    else:
+        images = [original_image] + generated_images
     
     for attempt in range(max_retries):
         response = call_gpt4o_with_images(
@@ -135,7 +139,7 @@ def evaluate_reasoning_visual_alignment(
 def evaluate_answer_visual_alignment(
     doc_id: str,
     task: str,
-    original_image: Union[str, Image.Image],
+    original_image: Union[str, Image.Image, List[Union[str, Image.Image]]],
     generated_images: List[Union[str, Image.Image]],
     answer: str,
     question: str,
@@ -150,7 +154,7 @@ def evaluate_answer_visual_alignment(
     Args:
         doc_id: Document ID
         task: Task name
-        original_image: Original question image
+        original_image: Original question image(s) - can be single image or list of images
         generated_images: List of generated visualization images
         answer: Final answer text
         question: Original question text
@@ -168,7 +172,11 @@ def evaluate_answer_visual_alignment(
     )
     
     # Build image list: original + all generated
-    images = [original_image] + generated_images
+    # Handle both single image and list of images
+    if isinstance(original_image, list):
+        images = original_image + generated_images
+    else:
+        images = [original_image] + generated_images
     
     for attempt in range(max_retries):
         response = call_gpt4o_with_images(
@@ -198,7 +206,7 @@ def evaluate_answer_visual_alignment(
 
 def evaluate_from_json(
     json_path: str,
-    original_image: Union[str, Image.Image],
+    original_image: Union[str, Image.Image, List[Union[str, Image.Image]]],
     metrics: List[str] = None,
     task_category: Optional[str] = None,
     max_retries: int = 3,
@@ -209,7 +217,7 @@ def evaluate_from_json(
 
     Args:
         json_path: Path to JSON metadata file
-        original_image: Path to original question image
+        original_image: Path to original question image(s) - can be single image or list of images
         metrics: List of metrics to evaluate ["ra", "al"] (default: both)
         task_category: Optional task category for customized prompts
         max_retries: Max retry attempts
@@ -286,7 +294,7 @@ def evaluate_from_json(
 
 def evaluate_batch_from_jsons(
     json_paths: List[str],
-    original_images: List[Union[str, Image.Image]],
+    original_images: List[Union[str, Image.Image, List[Union[str, Image.Image]]]],
     metrics: List[str] = None,
     task_category: Optional[str] = None,
     max_retries: int = 3,
@@ -298,7 +306,7 @@ def evaluate_batch_from_jsons(
 
     Args:
         json_paths: List of JSON file paths
-        original_images: List of original image paths (same order as json_paths)
+        original_images: List of original image paths (same order as json_paths) - each can be single image or list of images
         metrics: List of metrics to evaluate ["ra", "al"]
         task_category: Optional task category for customized prompts
         max_retries: Max retry attempts
@@ -373,7 +381,7 @@ class VisualCoTEvaluator:
     def evaluate_from_json(
         self,
         json_path: str,
-        original_image: Union[str, Image.Image],
+        original_image: Union[str, Image.Image, List[Union[str, Image.Image]]],
         task_category: Optional[str] = None,
     ) -> Dict:
         """
@@ -381,7 +389,7 @@ class VisualCoTEvaluator:
 
         Args:
             json_path: Path to JSON metadata file
-            original_image: Original question image
+            original_image: Original question image(s) - can be single image or list of images
             task_category: Override task category
 
         Returns:
@@ -400,7 +408,7 @@ class VisualCoTEvaluator:
     def evaluate_batch(
         self,
         json_paths: List[str],
-        original_images: List[Union[str, Image.Image]],
+        original_images: List[Union[str, Image.Image, List[Union[str, Image.Image]]]],
         max_workers: int = 10,
     ) -> List[Dict]:
         """
@@ -408,7 +416,7 @@ class VisualCoTEvaluator:
 
         Args:
             json_paths: List of JSON file paths
-            original_images: List of original image paths
+            original_images: List of original image paths - each can be single image or list of images
             max_workers: Max parallel workers
 
         Returns:
