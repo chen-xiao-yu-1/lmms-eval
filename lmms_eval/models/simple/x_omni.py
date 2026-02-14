@@ -23,7 +23,7 @@ class XOmni(lmms):
         mode: str = "understanding",
         flux_pipe_path: Optional[str] = None,
         output_image_dir: Optional[str] = None,
-        max_new_tokens: int = 512,
+        max_new_tokens: int = 256,  # Reduced from 512 to prevent excessive generation
         do_sample: bool = False,
         temperature: float = 0.7,
         top_p: float = 0.9,
@@ -134,30 +134,46 @@ class XOmni(lmms):
 
         # === Regex Patch Start ===
         from transformers.modeling_utils import PreTrainedModel
-        original_adjust = PreTrainedModel._adjust_missing_and_unexpected_keys
-        
-        def safe_adjust_keys(self, *args, **kwargs):
-            try:
-                return original_adjust(self, *args, **kwargs)
-            except Exception as e:
-                eval_logger.warning(f"IGNORED Regex Error in model loading: {e}")
-                
-                ret_list = []
-                for arg in args:
-                    if isinstance(arg, list):
-                        ret_list.append(arg)
-                
-                if len(ret_list) >= 2:
-                    return ret_list[0], ret_list[1]
-                else:
-                    return [], []
+        original_adjust = None
+        if hasattr(PreTrainedModel, '_adjust_missing_and_unexpected_keys'):
+            original_adjust = PreTrainedModel._adjust_missing_and_unexpected_keys
+            
+            def safe_adjust_keys(self, *args, **kwargs):
+                try:
+                    return original_adjust(self, *args, **kwargs)
+                except Exception as e:
+                    eval_logger.warning(f"IGNORED Regex Error in model loading: {e}")
+                    
+                    ret_list = []
+                    for arg in args:
+                        if isinstance(arg, list):
+                            ret_list.append(arg)
+                    
+                    if len(ret_list) >= 2:
+                        return ret_list[0], ret_list[1]
+                    else:
+                        return [], []
 
-        PreTrainedModel._adjust_missing_and_unexpected_keys = safe_adjust_keys
+            PreTrainedModel._adjust_missing_and_unexpected_keys = safe_adjust_keys
         
-        eval_logger.info("Loading model with trust_remote_code=True (and robust regex patch)...")
+        eval_logger.info("Loading model with trust_remote_code=True...")
         try:
+            # Load config first to modify max_position_embeddings
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(
+                model_path,
+                trust_remote_code=True
+            )
+            
+            # Increase max position embeddings to handle multi-image inputs
+            if hasattr(config, 'max_position_embeddings'):
+                original_max = config.max_position_embeddings
+                config.max_position_embeddings = 32768  # Increase from 8192 to 32768
+                eval_logger.info(f"Increased max_position_embeddings from {original_max} to {config.max_position_embeddings}")
+            
             self._model = AutoModelForCausalLM.from_pretrained(
                 model_path,
+                config=config,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=True,
@@ -166,7 +182,8 @@ class XOmni(lmms):
             eval_logger.error(f"Failed to load model via AutoModel: {e}")
             raise e
         finally:
-            PreTrainedModel._adjust_missing_and_unexpected_keys = original_adjust
+            if original_adjust is not None:
+                PreTrainedModel._adjust_missing_and_unexpected_keys = original_adjust
         # === Regex Patch End ===
 
         # Initialize vision components
@@ -308,12 +325,24 @@ class XOmni(lmms):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
-    def understand_image(self, prompt: str, image: Image.Image, doc_id: str) -> str:
+    def understand_images(self, prompt: str, images: List[Image.Image], doc_id: str) -> str:
+        """Understand multiple images with a text prompt"""
+        if not images:
+            eval_logger.warning(f"No images provided for understanding, doc_id={doc_id}")
+            return ""
+            
         self.set_seed(self.seed)
         self.model.set_generation_mode("text")
 
-        image_str = self.model.tokenize_image(image)
-        message = [{'role': 'user', 'content': image_str + '\n' + prompt}]
+        # Build multi-image prompt
+        image_strs = []
+        for img in images:
+            if img is not None:
+                image_strs.append(self.model.tokenize_image(img))
+
+        # Combine images and prompt
+        full_content = '\n'.join(image_strs) + '\n' + prompt
+        message = [{'role': 'user', 'content': full_content}]
 
         input_ids = self.tokenizer.apply_chat_template(
             message, add_generation_prompt=True, return_tensors="pt"
@@ -333,11 +362,17 @@ class XOmni(lmms):
                 eos_token_id=eos_token_id,
                 pad_token_id=0,
                 use_cache=True,
+                repetition_penalty=1.1,  # Prevent repetition
+                no_repeat_ngram_size=3,  # Prevent 3-gram repetition
             )
 
         texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
         output_text = texts[0] if texts else ""
         return output_text
+
+    def understand_image(self, prompt: str, image: Image.Image, doc_id: str) -> str:
+        """Understand single image with a text prompt (backward compatibility)"""
+        return self.understand_images(prompt, [image], doc_id)
 
     def generate_image(self, prompt: str, doc_id: str, task: str) -> Tuple[str, List[str]]:
         self.set_seed(self.seed)
@@ -400,12 +435,34 @@ class XOmni(lmms):
                     res.append("")
                     pbar.update(1)
                     continue
+                    
+                # Extract all images, not just the first one
                 visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
                 if not visuals:
                     res.append("")
                     pbar.update(1)
                     continue
-                res.append(self.understand_image(prompt, visuals[0], str(doc_id)))
+                
+                # Convert all visuals to PIL Images
+                images = []
+                for visual in visuals:
+                    if visual is not None:
+                        # Handle different visual formats
+                        if isinstance(visual, Image.Image):
+                            images.append(visual)
+                        elif hasattr(visual, 'convert'):  # PIL-like object
+                            images.append(visual.convert("RGB"))
+                        else:
+                            eval_logger.warning(f"Unsupported visual format: {type(visual)}")
+                
+                if not images:
+                    res.append("")
+                    pbar.update(1)
+                    continue
+                
+                # Use multi-image understanding
+                result = self.understand_images(prompt, images, str(doc_id))
+                res.append(result)
             else:
                 out_txt, out_imgs = self.generate_image(prompt, str(doc_id), task)
                 res.append(self.format_output(out_txt, out_imgs))

@@ -178,10 +178,24 @@ class XOmniVisualCoT(lmms):
 
         eval_logger.info("Loading model with trust_remote_code=True...")
         try:
+            # Load config first to modify max_position_embeddings
+            from transformers import AutoConfig
+            config = AutoConfig.from_pretrained(
+                model_path,
+                trust_remote_code=True
+            )
+            
+            # Increase max position embeddings to handle multi-image inputs
+            if hasattr(config, 'max_position_embeddings'):
+                original_max = config.max_position_embeddings
+                config.max_position_embeddings = 32768  # Increase from 8192 to 32768
+                eval_logger.info(f"Increased max_position_embeddings from {original_max} to {config.max_position_embeddings}")
+            
             # Load model without device_map to avoid issues with custom layers
             # We'll manually place it on available GPUs
             self._model = AutoModelForCausalLM.from_pretrained(
                 model_path,
+                config=config,
                 torch_dtype=torch.bfloat16,
                 trust_remote_code=True,
             )
@@ -391,6 +405,8 @@ class XOmniVisualCoT(lmms):
                     eos_token_id=eos_token_id,
                     pad_token_id=0,
                     use_cache=True,
+                    repetition_penalty=1.1,  # Prevent repetition
+                    no_repeat_ngram_size=3,  # Prevent 3-gram repetition
                 )
 
             texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
@@ -465,8 +481,8 @@ class XOmniVisualCoT(lmms):
     ) -> Tuple[str, List[str]]:
         """
         Uni-MMMU interleaved generation for X-Omni Visual CoT.
-
-        This implements the exact generation flow from Uni-MMMU:
+        
+        Aligned with Bagel's approach:
         - Jigsaw: gen_image(cand0) → gen_image(cand1) → gen_text(answer)
         - Maze/Sliding: [gen_text(plan) → gen_image(step)]×k → gen_text(answer)
 
@@ -536,142 +552,192 @@ class XOmniVisualCoT(lmms):
                 generated_images.extend(img_paths_1)
                 eval_logger.info(f"Saved jigsaw image 1: {img_paths_1[0]}")
 
-            # Final answer using stage 2 with all generated images
+            # Final answer using all images (original + generated)
             final_suffix = (
                 'Now output EXACTLY ONE <FINAL_ANSWER_JSON>{"choice": 0 or 1, "rationale": "≤30 words"}</FINAL_ANSWER_JSON>\\n'
                 "Do not output any additional images."
             )
             final_question = prompt + "\\n\\n" + final_suffix
 
-            # Use stage 2 to answer with the generated images
-            if len(generated_images) >= 2:
-                self.set_seed(self.seed)
-                self.model.set_generation_mode("text")
+            # Build complete image context: original images + generated images
+            all_images = []
+            # Add original input images (reference + candidates)
+            for img in input_images:
+                if img is not None:
+                    processed_img = self._extract_image_from_various_formats(img)
+                    if processed_img is not None:
+                        all_images.append(processed_img)
+            
+            # Add generated completion images
+            for img_path in generated_images:
+                try:
+                    gen_img = Image.open(img_path).convert("RGB")
+                    all_images.append(gen_img)
+                except Exception as e:
+                    eval_logger.warning(f"Failed to load generated image {img_path}: {e}")
 
-                # Load both generated images
-                gen_img0 = Image.open(generated_images[0]).convert("RGB")
-                gen_img1 = Image.open(generated_images[1]).convert("RGB")
-
-                # Build multi-image prompt
-                image_strs = []
-                if original_image is not None:
-                    image_strs.append(self.model.tokenize_image(original_image))
-                image_strs.append(self.model.tokenize_image(gen_img0))
-                image_strs.append(self.model.tokenize_image(gen_img1))
-
-                # Combine images and question
-                full_prompt = '\\n'.join(image_strs) + '\\n' + final_question
-                message = [{'role': 'user', 'content': full_prompt}]
-
-                input_ids = self.tokenizer.apply_chat_template(
-                    message, add_generation_prompt=True, return_tensors="pt"
-                )
-                input_ids = input_ids.to(self.model.device)
-                attention_mask = torch.ones_like(input_ids)
-                eos_token_id = self.tokenizer.encode('<|im_end|>')[0]
-
-                with torch.no_grad():
-                    output_ids = self.model.generate(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=self.stage2_max_new_tokens,
-                        do_sample=self.stage2_do_sample,
-                        temperature=self.stage2_temperature if self.stage2_do_sample else 0.0,
-                        top_p=self.stage2_top_p if self.stage2_do_sample else None,
-                        eos_token_id=eos_token_id,
-                        pad_token_id=0,
-                        use_cache=True,
-                    )
-
-                texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
-                final_text = texts[0] if texts else ""
-
-                # Clear GPU cache
-                del output_ids, input_ids, attention_mask, gen_img0, gen_img1
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                final_text = ""
+            # Generate final answer with all images
+            final_text = self._generate_text_with_multiple_images(
+                images=all_images,
+                question=final_question,
+                doc_id=doc_id
+            )
 
         else:
             # Maze/Sliding: [gen_text(plan) → gen_image(step)]×k → gen_text(answer)
+            # Following Bagel's approach: generate planning text first, then image
+            
+            step_texts = []  # Store all planning texts
+            step_images = []  # Store all generated step images
+            current_context_images = [original_image] if original_image else []
+            
             for i in range(1, num_images + 1):
-                # Generate step image with planning prompt
+                # Step 1: Generate planning text (like Bagel)
                 if task_type == "maze":
-                    plan_suffix = f'Step {i}: Generate an image showing the next move (one step up/down/left/right).'
+                    plan_suffix = f'Now planning for step {i}, Please output a sentence in the form: "Next, move one step up/down/left/right."'
                 else:  # sliding
-                    plan_suffix = f'Step {i}: Generate an image showing which tile to move and in which direction.'
+                    plan_suffix = f'Now planning for step {i}, Please output a sentence describing which tile to move and in which direction.'
 
-                gen_prompt = prompt + "\\n\\n" + plan_suffix
+                plan_prompt = prompt + "\\n\\n" + plan_suffix
+                
+                # Generate planning text using current context
+                plan_text = self._generate_text_with_multiple_images(
+                    images=current_context_images,
+                    question=plan_prompt,
+                    doc_id=f"{doc_id}_plan_{i}",
+                    max_tokens=128
+                )
+                
+                eval_logger.info(f"Step {i} plan: {plan_text}")
+                step_texts.append(plan_text)
 
+                # Step 2: Generate step image based on plan
+                img_prompt = prompt + "\\n\\n" + plan_text + f"\\n\\nNow, generate the image for step {i}."
+                
+                # Use the most recent image as context for generation
+                context_image = current_context_images[-1] if current_context_images else None
+                
                 _, img_paths = self._stage1_generate_image(
-                    generation_prompt=gen_prompt,
+                    generation_prompt=img_prompt,
                     doc_id=f"{doc_id}_step_{i:04d}",
                     task=task,
-                    original_image=original_image,
+                    original_image=context_image,
                 )
 
                 if img_paths:
                     generated_images.extend(img_paths)
                     eval_logger.info(f"Saved step {i} image: {img_paths[0]}")
+                    
+                    # Load and add to context for next step
+                    try:
+                        step_img = Image.open(img_paths[0]).convert("RGB")
+                        step_images.append(step_img)
+                        current_context_images.append(step_img)
+                        eval_logger.debug(f"Added step {i} image to context")
+                    except Exception as e:
+                        eval_logger.warning(f"Failed to load generated image for step {i}: {e}")
 
-            # Final answer using all generated step images
+            # Final answer generation with complete context
             final_suffix = (
                 "After the images, emit EXACTLY ONE LINE containing ONLY the final move list "
                 "as <ANSWER_JSON>[...]</ANSWER_JSON>. No other text."
             )
-            final_question = prompt + "\\n\\n" + final_suffix
+            
+            # Build complete context: original + all step texts and images
+            context_parts = [prompt]
+            for i, (plan_text, step_img) in enumerate(zip(step_texts, step_images), 1):
+                context_parts.append(f"Step {i} plan: {plan_text}")
+                context_parts.append(f"Step {i} completed.")
+            context_parts.append(final_suffix)
+            
+            final_question = "\\n\\n".join(context_parts)
 
-            # Use stage 2 to answer with all generated images
-            if generated_images:
-                self.set_seed(self.seed)
-                self.model.set_generation_mode("text")
-
-                # Load all generated images
-                step_images = [Image.open(img_path).convert("RGB") for img_path in generated_images]
-
-                # Build multi-image prompt
-                image_strs = []
-                if original_image is not None:
-                    image_strs.append(self.model.tokenize_image(original_image))
-                for step_img in step_images:
-                    image_strs.append(self.model.tokenize_image(step_img))
-
-                # Combine images and question
-                full_prompt = '\\n'.join(image_strs) + '\\n' + final_question
-                message = [{'role': 'user', 'content': full_prompt}]
-
-                input_ids = self.tokenizer.apply_chat_template(
-                    message, add_generation_prompt=True, return_tensors="pt"
-                )
-                input_ids = input_ids.to(self.model.device)
-                attention_mask = torch.ones_like(input_ids)
-                eos_token_id = self.tokenizer.encode('<|im_end|>')[0]
-
-                with torch.no_grad():
-                    output_ids = self.model.generate(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=self.stage2_max_new_tokens,
-                        do_sample=self.stage2_do_sample,
-                        temperature=self.stage2_temperature if self.stage2_do_sample else 0.0,
-                        top_p=self.stage2_top_p if self.stage2_do_sample else None,
-                        eos_token_id=eos_token_id,
-                        pad_token_id=0,
-                        use_cache=True,
-                    )
-
-                texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
-                final_text = texts[0] if texts else ""
-
-                # Clear GPU cache
-                del output_ids, input_ids, attention_mask, step_images
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            else:
-                final_text = ""
+            # Generate final answer with all context images
+            final_text = self._generate_text_with_multiple_images(
+                images=current_context_images,
+                question=final_question,
+                doc_id=doc_id
+            )
 
         return final_text, generated_images
+
+    def _generate_text_with_multiple_images(
+        self,
+        images: List[Image.Image],
+        question: str,
+        doc_id: str,
+        max_tokens: int = None
+    ) -> str:
+        """
+        Generate text response using multiple images as context.
+        
+        Args:
+            images: List of PIL Images to use as context
+            question: Text question/prompt
+            doc_id: Document ID for logging
+            max_tokens: Maximum tokens to generate (defaults to stage2_max_new_tokens)
+            
+        Returns:
+            Generated text response
+        """
+        if not images:
+            eval_logger.warning(f"No images provided for text generation, doc_id={doc_id}")
+            return ""
+            
+        try:
+            self.set_seed(self.seed)
+            self.model.set_generation_mode("text")
+
+            # Build multi-image prompt
+            image_strs = []
+            for img in images:
+                if img is not None:
+                    image_strs.append(self.model.tokenize_image(img))
+
+            # Combine images and question
+            full_prompt = '\\n'.join(image_strs) + '\\n' + question
+            message = [{'role': 'user', 'content': full_prompt}]
+
+            input_ids = self.tokenizer.apply_chat_template(
+                message, add_generation_prompt=True, return_tensors="pt"
+            )
+            input_ids = input_ids.to(self.model.device)
+            attention_mask = torch.ones_like(input_ids)
+            eos_token_id = self.tokenizer.encode('<|im_end|>')[0]
+
+            max_new_tokens = max_tokens if max_tokens is not None else self.stage2_max_new_tokens
+
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=self.stage2_do_sample,
+                    temperature=self.stage2_temperature if self.stage2_do_sample else 0.0,
+                    top_p=self.stage2_top_p if self.stage2_do_sample else None,
+                    eos_token_id=eos_token_id,
+                    pad_token_id=0,
+                    use_cache=True,
+                    repetition_penalty=1.1,  # Prevent repetition
+                    no_repeat_ngram_size=3,  # Prevent 3-gram repetition
+                )
+
+            texts, _ = self.model.mmdecode(self.tokenizer, output_ids[:, input_ids.shape[1]:-1])
+            result_text = texts[0] if texts else ""
+
+            # Clear GPU cache
+            del output_ids, input_ids, attention_mask
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            return result_text
+
+        except Exception as e:
+            eval_logger.error(f"Multi-image text generation failed for doc {doc_id}: {e}")
+            if self.fail_gracefully:
+                return ""
+            else:
+                raise
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
         res = []
@@ -730,12 +796,19 @@ class XOmniVisualCoT(lmms):
 
                 res.append(final_ans)
             else:
-                # Standard single-image generation mode
-                # Get original image
+                # Standard multi-image generation mode
+                # Get all original images
+                original_images = []
                 if doc_to_visual is not None:
                     visuals = self.flatten([doc_to_visual(self.task_dict[task][split][doc_id])])
-                    if visuals:
-                        original_image = self._extract_image_from_various_formats(visuals[0])
+                    for visual in visuals:
+                        if visual is not None:
+                            img = self._extract_image_from_various_formats(visual)
+                            if img is not None:
+                                original_images.append(img)
+
+                # Use first image for generation context, but keep all for final answer
+                primary_image = original_images[0] if original_images else None
 
                 # Stage 1: Generate visual diagram
                 generation_prompt = self.generation_prompt_template.format(question=contexts)
@@ -744,20 +817,40 @@ class XOmniVisualCoT(lmms):
                     generation_prompt,
                     str(doc_id),
                     task,
-                    original_image
+                    primary_image
                 )
 
-                # Stage 2: Answer with generated image
+                # Stage 2: Answer with all images (original + generated)
                 if gen_paths:
-                    eval_logger.info(f"Stage 2: Answering with generated image for doc {doc_id}")
-                    final_answer = self._stage2_understand_with_images(
-                        contexts,
-                        original_image,
-                        gen_paths[0]
+                    eval_logger.info(f"Stage 2: Answering with all images for doc {doc_id}")
+                    
+                    # Load generated image
+                    generated_images = []
+                    for gen_path in gen_paths:
+                        try:
+                            gen_img = Image.open(gen_path).convert("RGB")
+                            generated_images.append(gen_img)
+                        except Exception as e:
+                            eval_logger.warning(f"Failed to load generated image {gen_path}: {e}")
+                    
+                    # Combine all images for final answer
+                    all_images = original_images + generated_images
+                    
+                    final_answer = self._generate_text_with_multiple_images(
+                        images=all_images,
+                        question=contexts,
+                        doc_id=str(doc_id)
                     )
                 else:
-                    eval_logger.warning(f"No image generated for doc {doc_id}, returning empty answer")
-                    final_answer = ""
+                    eval_logger.warning(f"No image generated for doc {doc_id}, using original images only")
+                    if original_images:
+                        final_answer = self._generate_text_with_multiple_images(
+                            images=original_images,
+                            question=contexts,
+                            doc_id=str(doc_id)
+                        )
+                    else:
+                        final_answer = ""
 
                 # Save intermediate artifacts
                 self._save_intermediate_artifacts(
@@ -773,8 +866,14 @@ class XOmniVisualCoT(lmms):
                 res.append(final_answer)
 
             # Clear memory after each request
-            if original_image is not None:
-                del original_image
+            if 'original_images' in locals() and original_images:
+                for img in original_images:
+                    if img is not None:
+                        del img
+            if 'generated_images' in locals() and generated_images:
+                for img in generated_images:
+                    if img is not None:
+                        del img
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
